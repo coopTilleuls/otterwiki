@@ -20,3 +20,12 @@ docker-compose.override.yml
 .tox
 .idea
 otterwiki*.tgz
+# files for OIDC dev
+Dockerfile-lt
+docker-compose-lt.yml
+build_dev.sh
+docker/entrypoint-lt.sh
+docker/nginx.conf
+docker/wiki.cert
+docker/wiki.key
+helm/templates/secret-auth.yaml

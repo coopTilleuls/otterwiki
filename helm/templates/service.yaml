@@ -13,3 +13,20 @@ spec:
       name: http
   selector:
     {{- include "otterwiki.selectorLabels" . | nindent 4 }}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "otterwiki.fullname" . }}-caddy
+  labels:
+    {{- include "caddy.selectorLabels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: 443
+      targetPort: 443
+      protocol: TCP
+      name: https
+  selector:
+    {{- include "caddy.selectorLabels" . | nindent 4 }}

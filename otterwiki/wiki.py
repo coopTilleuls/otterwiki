@@ -445,19 +445,7 @@ class Page:
     def view(self):
         # handle permissions
         if not has_permission("READ"):
-            if current_user.is_authenticated and not current_user.is_approved:
-                toast(
-                    "You lack the permissions to access this wiki. Please wait for approval."
-                )
-            elif current_user.is_authenticated and current_user.is_approved:
-                toast(
-                    "You are logged in but lack READ permissions. Please wait for an administrator to grant access."
-                )
-            else:
-                toast(
-                    "You lack the permissions to access this wiki. Please login."
-                )
-            return redirect(url_for("login"))
+            return redirect(url_for("gcp_login"))
         # handle case that page doesn't exists
         self.exists_or_404()
 
@@ -1065,10 +1053,7 @@ class Page:
     def load_draft(self, author):
         self.expire_anonymous_drafts()
 
-        if current_user.is_anonymous:
-            author_email = current_user.anonymous_uid()
-        else:
-            author_email = author[1]
+        author_email = author[1]
 
         draft = Drafts.query.filter_by(
             pagepath=self.pagepath, author_email=author_email
@@ -1076,10 +1061,8 @@ class Page:
         return draft
 
     def discard_draft(self, author):
-        if current_user.is_anonymous:
-            author_email = current_user.anonymous_uid()
-        else:
-            author_email = author[1]
+
+        author_email = author[1]
 
         Drafts.query.filter_by(
             pagepath=self.pagepath, author_email=author_email
@@ -1092,10 +1075,7 @@ class Page:
         if not has_permission("WRITE"):
             abort(403)
         # Handle anonymous users, save draft in session
-        if current_user.is_anonymous:
-            author_email = current_user.anonymous_uid()
-        else:
-            author_email = author[1]
+        author_email = author[1]
 
         # find existing Draft
         draft = Drafts.query.filter_by(

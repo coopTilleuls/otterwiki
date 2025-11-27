@@ -1,0 +1,29 @@
+
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-production
+    #nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    #nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+
+  hosts:
+    - host: wiki.lt-mut-prod.les-tilleuls.solutions
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+    - host: auth-wiki.lt-mut-prod.les-tilleuls.solutions
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls:
+    - secretName: otterwiki-tls
+      hosts:
+        - wiki.lt-mut-prod.les-tilleuls.solutions
+        - auth-wiki.lt-mut-prod.les-tilleuls.solutions
+
+config:
+  SITE_NAME: wiki-sre
+  AUTH_METHOD: SIMPLE
+  READ_ACCESS: REGISTERED
+  WRITE_ACCESS: REGISTERED

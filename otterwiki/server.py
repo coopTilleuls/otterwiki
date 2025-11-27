@@ -19,9 +19,9 @@ from otterwiki.renderer import OtterwikiRenderer
 app = Flask(__name__)
 # default configuration settings
 app.config.update(
-    DEBUG=False,  # make sure DEBUG is off unless enabled explicitly otherwise
-    TESTING=False,
-    LOG_LEVEL="INFO",
+    DEBUG=True,  # make sure DEBUG is off unless enabled explicitly otherwise
+    TESTING=True,
+    LOG_LEVEL="DEBUG",
     REPOSITORY=None,
     SECRET_KEY="CHANGE ME",
     SITE_NAME="An Otter Wiki",
@@ -264,3 +264,5 @@ githttpserver = otterwiki.remote.GitHttpServer(path=app.config["REPOSITORY"])
 # contains application routes,
 # using side-effect of import executing the file to get
 import otterwiki.views  # pyright: ignore
+if app.config.get("AUTH_METHOD") == "CGP_OAUTH":
+    import otterwiki.google_auth
