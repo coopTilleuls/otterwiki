@@ -709,12 +709,21 @@ class GcpOAth2:
     def get_all_user(self):
         return self.User.query.order_by(self.User.email).all()
 
-    def has_permission(self, permission, id):
-        user = self.User.query.filter_by(id=id).first()
-        return True
-        if not user.is_authenticated:
+    def has_permission(self, permission, user):
+        if user == False:
             return False
-        return permission.upper() in user.permissions
+        if user.is_authenticated:
+            if user.is_admin:
+                return True
+            if permission.upper() == "READ" and user.allow_read:
+                return True
+            if permission.upper() == "WRITE" and user.allow_write:
+                return True
+            if permission.upper() == "UPLOAD" and user.allow_upload:
+                return True
+            return True
+        return False
+
     def supported_features(self):
         return {'passwords': False, 'editing': False, 'logout': True}
 
@@ -853,13 +862,7 @@ def check_credentials(email, password):
 # utils
 #
 def has_permission(permission, user=current_user):
-    if app.config.get("AUTH_METHOD") == "CGP_OAUTH":
-        if current_user == False:
-            return False
-        if current_user.is_authenticated:
-            return auth_manager.has_permission(permission, current_user.id )
-    else:
-        return auth_manager.has_permission(permission, user)
+    return auth_manager.has_permission(permission, user)
 
 if app.config.get("AUTH_METHOD") == "CGP_OAUTH":
     @login_manager.user_loader
