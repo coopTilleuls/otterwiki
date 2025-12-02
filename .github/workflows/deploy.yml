@@ -3,11 +3,11 @@ name: Deploy
 on:
   workflow_call:
     secrets:
-      project-id:
-        description: GCP project ID
-        required: true
       workload-identity-provider:
         description: GCP workload identity provider
+        required: true
+      project-id:
+        description: GCP project ID
         required: true
       google_client_id:
         description: client id for oidc
@@ -16,7 +16,7 @@ on:
         description: GCP Client secret for OIDC
         required: true
 
-
+jobs:
   deploy:
     name: Deploy
     runs-on: ubuntu-latest
