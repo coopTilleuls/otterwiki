@@ -684,6 +684,11 @@ class GcpOAth2:
     def get_current_user(self, id):
         return self.User.query.filter_by(id=id).first()
 
+    def handle_logout(self):
+        logout_user()
+        toast("You logged out successfully.")
+        return redirect(url_for("gcp_login"))
+
     def get_author(self):
         if not current_user.is_authenticated:
             return ("Anonymous", "")

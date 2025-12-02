@@ -31,6 +31,7 @@ def gcp_login():
     # scopes that let you retrieve user's profile from Google
     request_uri = client.prepare_request_uri(
         authorization_endpoint,
+        hosted_domain=os.environ.get("GOOGLE_AUTH_DOMAIN", None),
         redirect_uri=request.base_url + "/callback",
         scope=["openid", "email", "profile"],
     )
@@ -40,7 +41,7 @@ def gcp_login():
 def gcp_callback():
     # Get authorization code Google sent back to you
     code = request.args.get("code")
-
+    print(code)
     # Find out what URL to hit to get tokens that allow you to ask for
     # things on behalf of a user
     google_provider_cfg = get_google_provider_cfg()
@@ -70,16 +71,26 @@ def gcp_callback():
     userinfo_response = requests.get(uri, headers=headers, data=body)
     # You want to make sure their email is verified.
     # The user authenticated with Google, authorized your
+    user_info = userinfo_response.json()
     # app, and now you've verified their email through Google!
-    if userinfo_response.json().get("email_verified"):
-        unique_id = userinfo_response.json()["sub"]
-        users_email = userinfo_response.json()["email"]
-        picture = userinfo_response.json()["picture"]
-        users_name = userinfo_response.json()["given_name"]
+    if not user_info.get("hd", "not_available") == os.environ.get("GOOGLE_AUTH_DOMAIN", None):
+        return "User email not available or not verified by Google.", 400
+
+    if user_info.get("email_verified"):
+        unique_id = user_info["sub"]
+        users_email = user_info["email"]
+        picture = user_info["picture"]
+        users_name = user_info["given_name"]
     else:
         return "User email not available or not verified by Google.", 400
     # Create a user in your db with the information provided
     # by Google
+    print(headers)
+    data = requests.get("https://admin.googleapis.com/admin/directory/v1/groups/sre@les-tilleuls.coop/members",
+        headers=headers,
+                       )
+    print(data.text)
+    print("*******************************")
     user = auth_manager.handle_login(
         id=unique_id, name=users_name, email=users_email, profile_pic=picture
     )
