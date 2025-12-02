@@ -2,7 +2,6 @@
 import os
 import json
 import requests
-import sqlite3
 from flask import redirect, request, url_for
 from oauthlib.oauth2 import WebApplicationClient
 from otterwiki.server import app

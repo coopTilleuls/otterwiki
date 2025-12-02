@@ -679,11 +679,10 @@ class GcpOAth2:
 
     # called on every page load
     def user_loader(self, id):
-        return self.user.query.filter_by(id=id).first()
+        return self.User.query.filter_by(id=id).first()
 
     def get_current_user(self, id):
         return self.User.query.filter_by(id=id).first()
-
 
     def get_author(self):
         if not current_user.is_authenticated:
@@ -711,7 +710,7 @@ class GcpOAth2:
 
     def has_permission(self, permission, user):
         if user == False:
-            return False
+            return False  # Only logged-in users can access the wiki
         if user.is_authenticated:
             if user.is_admin:
                 return True
@@ -864,15 +863,9 @@ def check_credentials(email, password):
 def has_permission(permission, user=current_user):
     return auth_manager.has_permission(permission, user)
 
-if app.config.get("AUTH_METHOD") == "CGP_OAUTH":
-    @login_manager.user_loader
-    def _get_current_user(id):
-        return auth_manager.get_current_user(id)
-    def get_current_user():
-        return
-else:
-    def get_current_user():
-        return current_user
+def get_current_user():
+    return current_user
+
 app.jinja_env.globals.update(has_permission=has_permission)
 
 # these features help enable / disable the relevant parts of the UI
