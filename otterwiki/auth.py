@@ -5,6 +5,7 @@ import hmac
 from datetime import datetime
 from urllib.parse import urlsplit
 from uuid import uuid4
+import os
 
 import flask_login
 from flask import (
@@ -31,7 +32,7 @@ from otterwiki.helper import (
     deserialize,
     SerializeError,
 )
-from otterwiki.models import User as UserModel
+from otterwiki.server import User as UserModel
 from otterwiki.server import app, db
 from otterwiki.util import is_valid_email, is_valid_name
 from otterwiki.util import random_password, empty
@@ -648,6 +649,87 @@ class ProxyHeaderAuth:
             return False
         return permission.upper() in user.permissions
 
+class GcpOAth2:
+
+    class User(UserMixin, UserModel):
+        pass
+
+    def handle_login(self,id , name, email, profile_pic):
+        user = self.User(
+            id=id,
+            name=name,
+            email=email,
+            password_hash="xxxx",
+            first_seen=datetime.now(),
+            last_seen=datetime.now(),
+            is_admin=True,
+            is_approved=True
+        )
+        # Doesn't exist? Add it to the database.
+        if not self.User.query.filter_by(id=id).first():
+            # add to database
+            db.session.add(user)
+            db.session.commit()
+            # log user creation
+            app.logger.info(
+                "auth: New user registered: {} <{}>".format(name, email)
+            )
+        login_user(user, remember=True)
+        return user
+
+    # called on every page load
+    def user_loader(self, id):
+        return self.User.query.filter_by(id=id).first()
+
+    def get_current_user(self, id):
+        return self.User.query.filter_by(id=id).first()
+
+    def handle_logout(self):
+        logout_user()
+        toast("You logged out successfully.")
+        return redirect(url_for("gcp_login"))
+
+    def get_author(self):
+        if not current_user.is_authenticated:
+            return ("Anonymous", "")
+        return (current_user.name, current_user.email)
+
+    # user will be directed to login form first, we should redirect them to handle_login automatically (just a POST to /-/login)
+    def login_form(self, *args, **kwargs):
+        if current_user.is_authenticated and self.has_permission(
+            'READ', current_user
+        ):
+            return redirect(url_for("index"))
+        else:
+            return abort(403)
+
+    def settings_form(self):
+        return render_template(
+            "settings.html",
+            title="Settings",
+            user_list=None,  # no users are stored in the database anyways
+        )
+
+    def get_all_user(self):
+        return self.User.query.order_by(self.User.email).all()
+
+    def has_permission(self, permission, user):
+        if user == False:
+            return False  # Only logged-in users can access the wiki
+        if user.is_authenticated:
+            if user.is_admin:
+                return True
+            if permission.upper() == "READ" and user.allow_read:
+                return True
+            if permission.upper() == "WRITE" and user.allow_write:
+                return True
+            if permission.upper() == "UPLOAD" and user.allow_upload:
+                return True
+            return True
+        return False
+
+    def supported_features(self):
+        return {'passwords': False, 'editing': False, 'logout': True}
 
 class OtterWikiAnonymousUser(flask_login.AnonymousUserMixin):
     def anonymous_uid(self):
@@ -662,7 +744,10 @@ class OtterWikiAnonymousUser(flask_login.AnonymousUserMixin):
 # create login manager
 login_manager = LoginManager()
 login_manager.init_app(app)
-login_manager.login_view = "login"  # pyright: ignore
+if app.config.get("AUTH_METHOD") == "CGP_OAUTH":
+    login_manager.login_view = "gcp_login"  # pyright: ignore
+else:
+    login_manager.login_view = "login"  # pyright: ignore
 login_manager.anonymous_user = OtterWikiAnonymousUser
 
 # create auth_manager
@@ -674,6 +759,8 @@ elif app.config.get("AUTH_METHOD") == "PROXY_HEADER":
         email_header=app.config.get("AUTH_HEADERS_EMAIL"),
         permissions_header=app.config.get("AUTH_HEADERS_PERMISSIONS"),
     )
+elif app.config.get("AUTH_METHOD") == "CGP_OAUTH":
+    auth_manager = GcpOAth2()
 else:
     raise RuntimeError(
         "Unknown AUTH_METHOD '{}'".format(app.config.get("AUTH_METHOD"))
@@ -781,6 +868,8 @@ def check_credentials(email, password):
 def has_permission(permission, user=current_user):
     return auth_manager.has_permission(permission, user)
 
+def get_current_user():
+    return current_user
 
 app.jinja_env.globals.update(has_permission=has_permission)
 

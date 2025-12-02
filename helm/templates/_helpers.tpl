@@ -49,3 +49,8 @@ Selector labels
 app.kubernetes.io/name: {{ include "otterwiki.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
+
+{{- define "caddy.selectorLabels" -}}
+app.kubernetes.io/name: caddy
+app.kubernetes.io/instance: caddy
+{{- end }}
