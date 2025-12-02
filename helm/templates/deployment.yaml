@@ -48,6 +48,9 @@ spec:
           - secretRef:
               name: {{ include "otterwiki.fullname" . }}-config
               optional: true
+          - secretRef:
+              name: google-auth
+              optional: true
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}

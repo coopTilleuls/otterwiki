@@ -1,18 +1,18 @@
+image:
+  repository: ghcr.io/cooptilleuls/sre/wiki
+  tag: 2
+
+imagePullSecrets:
+  - name: regcred
 
 ingress:
   enabled: true
   className: "nginx"
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-production
-    #nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
-    #nginx.ingress.kubernetes.io/ssl-passthrough: "true"
 
   hosts:
     - host: wiki.lt-mut-prod.les-tilleuls.solutions
-      paths:
-        - path: /
-          pathType: ImplementationSpecific
-    - host: auth-wiki.lt-mut-prod.les-tilleuls.solutions
       paths:
         - path: /
           pathType: ImplementationSpecific
@@ -20,10 +20,17 @@ ingress:
     - secretName: otterwiki-tls
       hosts:
         - wiki.lt-mut-prod.les-tilleuls.solutions
-        - auth-wiki.lt-mut-prod.les-tilleuls.solutions
 
 config:
   SITE_NAME: wiki-sre
-  AUTH_METHOD: SIMPLE
+  AUTH_METHOD: CGP_OAUTH
+  DISABLE_REGISTRATION: "true"
+  GOOGLE_AUTH_DOMAIN: les-tilleuls.coop
+  MAIL_DEFAULT_SENDER: no-reply@example.com
+  MAIL_PORT: "465"
+  MAIL_SERVER: smtp.server.tld
+  MAIL_USE_SSL: "true"
+  MAIL_USERNAME: otterwiki@example.com
+  ATTACHMENT_ACCESS: APPROVED
   READ_ACCESS: REGISTERED
   WRITE_ACCESS: REGISTERED
