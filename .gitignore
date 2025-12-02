@@ -28,4 +28,3 @@ docker/entrypoint-lt.sh
 docker/nginx.conf
 docker/wiki.cert
 docker/wiki.key
-helm/templates/secret-auth.yaml
