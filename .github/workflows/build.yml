@@ -9,7 +9,7 @@ on:
         required: true
 
 jobs:
-  build-push-otterwiki:
+  build:
     runs-on: ubuntu-latest
 
     steps:
@@ -19,9 +19,9 @@ jobs:
       uses: coopTilleuls/action-docker-build-push@v10
       with:
         IMAGE_NAME: otterwiki
-        ßUILD_CONTEXT: .
+        BUILD_CONTEXT: .
         REGISTRY_JSON_KEY: ${{ secrets.GITHUB_TOKEN }}
         IMAGE_REPOSITORY: ghcr.io/cooptilleuls
+        SKIP_CHECKOUT: "true"
         # Deactivate Trivy
         SECURITY_SCAN: "false"
-
