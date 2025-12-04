@@ -1,5 +1,5 @@
 image:
-  repository: ghcr.io/cooptilleuls/sre/wiki
+  repository: ghcr.io/cooptilleuls/otterwiki
   tag: 2
 
 imagePullSecrets:
