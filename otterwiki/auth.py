@@ -655,18 +655,25 @@ class GcpOAth2:
         pass
 
     def handle_login(self,id , name, email, profile_pic):
+        if len(self.User.query.all()) < 1:
+            is_admin = True
+
+        else:
+            is_admin = False
+
+        # create user object
         user = self.User(
-            id=id,
             name=name,
             email=email,
-            password_hash="xxxx",
             first_seen=datetime.now(),
             last_seen=datetime.now(),
-            is_admin=True,
-            is_approved=True
+            is_admin=is_admin,
+            allow_read=True,  # All users connected by OAuh2  can Read, Write and Upload
+            allow_write=True,
+            allow_upload=True
         )
         # Doesn't exist? Add it to the database.
-        if not self.User.query.filter_by(id=id).first():
+        if not self.User.query.filter_by(email=email).first():
             # add to database
             db.session.add(user)
             db.session.commit()
@@ -674,8 +681,9 @@ class GcpOAth2:
             app.logger.info(
                 "auth: New user registered: {} <{}>".format(name, email)
             )
-        login_user(user, remember=True)
-        return user
+        db_user = self.User.query.filter_by(email=email).first()
+        login_user(db_user, remember=True)
+        return db_user
 
     # called on every page load
     def user_loader(self, id):
@@ -729,7 +737,7 @@ class GcpOAth2:
         return False
 
     def supported_features(self):
-        return {'passwords': False, 'editing': False, 'logout': True}
+        return {'passwords': False, 'editing': True, 'logout': True}
 
 class OtterWikiAnonymousUser(flask_login.AnonymousUserMixin):
     def anonymous_uid(self):
@@ -867,9 +875,6 @@ def check_credentials(email, password):
 #
 def has_permission(permission, user=current_user):
     return auth_manager.has_permission(permission, user)
-
-def get_current_user():
-    return current_user
 
 app.jinja_env.globals.update(has_permission=has_permission)
 

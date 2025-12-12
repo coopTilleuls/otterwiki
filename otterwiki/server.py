@@ -19,9 +19,9 @@ from otterwiki.renderer import OtterwikiRenderer
 app = Flask(__name__)
 # default configuration settings
 app.config.update(
-    DEBUG=True,  # make sure DEBUG is off unless enabled explicitly otherwise
-    TESTING=True,
-    LOG_LEVEL="DEBUG",
+    DEBUG=False,  # make sure DEBUG is off unless enabled explicitly otherwise
+    TESTING=False,
+    LOG_LEVEL="INFO",
     REPOSITORY=None,
     SECRET_KEY="CHANGE ME",
     SITE_NAME="An Otter Wiki",

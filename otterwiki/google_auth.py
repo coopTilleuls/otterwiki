@@ -1,4 +1,4 @@
-#!/usr/bin/env pyggghon
+#!/usr/bin/env python
 import os
 import json
 import requests
@@ -41,7 +41,6 @@ def gcp_login():
 def gcp_callback():
     # Get authorization code Google sent back to you
     code = request.args.get("code")
-    print(code)
     # Find out what URL to hit to get tokens that allow you to ask for
     # things on behalf of a user
     google_provider_cfg = get_google_provider_cfg()
@@ -85,12 +84,6 @@ def gcp_callback():
         return "User email not available or not verified by Google.", 400
     # Create a user in your db with the information provided
     # by Google
-    print(headers)
-    data = requests.get("https://admin.googleapis.com/admin/directory/v1/groups/sre@les-tilleuls.coop/members",
-        headers=headers,
-                       )
-    print(data.text)
-    print("*******************************")
     user = auth_manager.handle_login(
         id=unique_id, name=users_name, email=users_email, profile_pic=picture
     )
