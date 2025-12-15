@@ -8,21 +8,21 @@ from otterwiki.server import app
 from otterwiki.auth import auth_manager
 
 # Configuration
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", None)
-GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", None)
+OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", None)
+OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", None)
 GOOGLE_DISCOVERY_URL = (
     "https://accounts.google.com/.well-known/openid-configuration"
 )
 
 
 # OAuth 2 client setup
-client = WebApplicationClient(GOOGLE_CLIENT_ID)
+client = WebApplicationClient(OAUTH_CLIENT_ID)
 
 def get_google_provider_cfg():
     return requests.get(GOOGLE_DISCOVERY_URL).json()
 
-@app.route("/-/gcp_login")
-def gcp_login():
+@app.route("/-/oauth2_login")
+def oauth2_login():
     # Find out what URL to hit for Google login
     google_provider_cfg = get_google_provider_cfg()
     authorization_endpoint = google_provider_cfg["authorization_endpoint"]
@@ -32,9 +32,10 @@ def gcp_login():
     request_uri = client.prepare_request_uri(
         authorization_endpoint,
         hosted_domain=os.environ.get("GOOGLE_AUTH_DOMAIN", None),
-        redirect_uri=request.base_url + "/callback",
+        redirect_uri=request.base_url.replace("oauth2_login","gcp_login/callback"),
         scope=["openid", "email", "profile"],
     )
+    print(request_uri)
     return redirect(request_uri)
 
 @app.route("/-/gcp_login/callback")
@@ -57,7 +58,7 @@ def gcp_callback():
         token_url,
         headers=headers,
         data=body,
-        auth=(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET),
+        auth=(OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET),
     )
 
     # Parse the tokens!

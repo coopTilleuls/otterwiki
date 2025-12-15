@@ -32,7 +32,7 @@ from otterwiki.helper import (
     deserialize,
     SerializeError,
 )
-from otterwiki.server import User as UserModel
+from otterwiki.models import User as UserModel
 from otterwiki.server import app, db
 from otterwiki.util import is_valid_email, is_valid_name
 from otterwiki.util import random_password, empty
@@ -695,7 +695,7 @@ class OAuth2:
     def handle_logout(self):
         logout_user()
         toast("You logged out successfully.")
-        return redirect(url_for("gcp_login"))
+        return redirect(url_for("oauth2_login"))
 
     def get_author(self):
         if not current_user.is_authenticated:
@@ -753,7 +753,7 @@ class OtterWikiAnonymousUser(flask_login.AnonymousUserMixin):
 login_manager = LoginManager()
 login_manager.init_app(app)
 if app.config.get("AUTH_METHOD") == "OAUTH2":
-    login_manager.login_view = "gcp_login"  # pyright: ignore
+    login_manager.login_view = "oauth2_login"  # pyright: ignore
 else:
     login_manager.login_view = "login"  # pyright: ignore
 login_manager.anonymous_user = OtterWikiAnonymousUser

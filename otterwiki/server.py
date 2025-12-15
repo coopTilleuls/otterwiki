@@ -278,4 +278,4 @@ githttpserver = otterwiki.remote.GitHttpServer(path=app.config["REPOSITORY"])
 # using side-effect of import executing the file to get
 import otterwiki.views  # pyright: ignore
 if app.config.get("AUTH_METHOD") == "OAUTH2":
-    import otterwiki.google_auth
+    import otterwiki.oauth2
