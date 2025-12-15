@@ -61,7 +61,12 @@ def gcp_callback():
     )
 
     # Parse the tokens!
-    client.parse_request_body_response(json.dumps(token_response.json()))
+    response = token_response.json()
+    if 'error' in response.keys():
+        print(type(response))
+        return f"Error from Oauth  serveur : {response}.", 400
+
+    client.parse_request_body_response(json.dumps(response))
     # Now that you have tokens (yay) let's find and hit the URL
     # from Google that gives you the user's profile information,
     # including their Google profile image and email

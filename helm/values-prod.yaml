@@ -23,7 +23,7 @@ ingress:
 
 config:
   SITE_NAME: wiki-sre
-  AUTH_METHOD: CGP_OAUTH
+  AUTH_METHOD: OAUTH2
   DISABLE_REGISTRATION: "true"
   GOOGLE_AUTH_DOMAIN: les-tilleuls.coop
   MAIL_DEFAULT_SENDER: no-reply@example.com

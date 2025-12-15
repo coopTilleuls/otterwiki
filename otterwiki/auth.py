@@ -649,7 +649,7 @@ class ProxyHeaderAuth:
             return False
         return permission.upper() in user.permissions
 
-class GcpOAth2:
+class OAuth2:
 
     class User(UserMixin, UserModel):
         pass
@@ -752,7 +752,7 @@ class OtterWikiAnonymousUser(flask_login.AnonymousUserMixin):
 # create login manager
 login_manager = LoginManager()
 login_manager.init_app(app)
-if app.config.get("AUTH_METHOD") == "CGP_OAUTH":
+if app.config.get("AUTH_METHOD") == "OAUTH2":
     login_manager.login_view = "gcp_login"  # pyright: ignore
 else:
     login_manager.login_view = "login"  # pyright: ignore
@@ -767,8 +767,8 @@ elif app.config.get("AUTH_METHOD") == "PROXY_HEADER":
         email_header=app.config.get("AUTH_HEADERS_EMAIL"),
         permissions_header=app.config.get("AUTH_HEADERS_PERMISSIONS"),
     )
-elif app.config.get("AUTH_METHOD") == "CGP_OAUTH":
-    auth_manager = GcpOAth2()
+elif app.config.get("AUTH_METHOD") == "OAUTH2":
+    auth_manager = OAuth2()
 else:
     raise RuntimeError(
         "Unknown AUTH_METHOD '{}'".format(app.config.get("AUTH_METHOD"))
