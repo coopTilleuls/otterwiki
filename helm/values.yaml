@@ -18,6 +18,7 @@ config: {}
 ## read from secrets or configmaps. For the otterwiki configuration stick to the config dict
 ## these will we stored in a configMap and the secrets in a Secret.
 env: {}
+envFromSecret: {}
 
 imagePullSecrets: []
 nameOverride: ""

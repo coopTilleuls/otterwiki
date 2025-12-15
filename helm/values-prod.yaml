@@ -20,6 +20,8 @@ ingress:
     - secretName: otterwiki-tls
       hosts:
         - wiki.lt-mut-prod.les-tilleuls.solutions
+envFromSecret:
+  secretName: google-auth
 
 config:
   SITE_NAME: wiki-sre
