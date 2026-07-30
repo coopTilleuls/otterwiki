@@ -48,9 +48,9 @@ spec:
           - secretRef:
               name: {{ include "otterwiki.fullname" . }}-config
               optional: true
-          {{- if .Values.envFromSecret }}
+          {{- if .Values.envFromSecret.secretName }}
           - secretRef:
-              name: {{- if .Values.envFromSecret.secretName }}
+              name: {{ .Values.envFromSecret.secretName }}
               optional: true
           {{- end }}
           ports:

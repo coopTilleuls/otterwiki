@@ -1,12 +1,12 @@
 image:
   repository: ghcr.io/cooptilleuls/otterwiki
-  tag: 2
+  tag: t1.9.1
 
 imagePullSecrets:
   - name: regcred
 
 ingress:
-  enabled: true
+  enabled: false
   className: "nginx"
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-production
@@ -22,6 +22,8 @@ ingress:
         - wiki.lt-mut-prod.les-tilleuls.solutions
 envFromSecret:
   secretName: google-auth
+route:
+  host: wiki.lt-mut-prod-scw.les-tilleuls.solutions
 
 config:
   SITE_NAME: wiki-sre

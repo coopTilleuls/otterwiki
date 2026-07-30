@@ -56,6 +56,23 @@ ingress:
   #  - secretName: otterwiki-local-tls
   #    hosts:
   #      - otterwiki.local
+route:
+  enabled: true
+  gateway:
+    # -- Name of the (pre-existing) Gateway this HTTPRoute attaches to.
+    name: traefik
+    # -- Set when the Gateway lives in a different namespace than this release. Requires a ReferenceGrant in
+    # that namespace allowing HTTPRoutes from this release's namespace to attach (created alongside the Gateway,
+    # not by this chart).
+    namespace: infra-traefik
+    # -- Restrict attachment to one specific listener on the Gateway (e.g. a dedicated HTTPS listener), leave
+    # empty to attach to every listener that allows it.
+    sectionName: https
+  # -- Free-form, in case the HTTPRoute itself ever needs annotations (rare with Gateway API)
+  annotations: {}
+  host: example.com
+  # -- Additional hostnames routed to the same backend (e.g. a bare/www alias)
+  extraHosts: []
 
 resources: {}
   # limits:
@@ -67,7 +84,7 @@ resources: {}
 
 persistence:
   enabled: true
-  size: 512Mi
+  size: 1Gi
   accessMode: ReadWriteOnce
   annotations: {}
   storageClassName: ""
