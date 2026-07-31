@@ -23,7 +23,7 @@ ingress:
 envFromSecret:
   secretName: google-auth
 route:
-  host: wiki.lt-mut-prod-scw.les-tilleuls.solutions
+  host: wiki-sre.les-tilleuls.solutions
 
 config:
   SITE_NAME: wiki-sre
