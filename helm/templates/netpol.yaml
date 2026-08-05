@@ -1,0 +1,46 @@
+# Allow ingress from Traefik and the egress otterwiki needs (Google OAuth2, SMTP, DNS).
+# The namespace-wide default-deny + ACME HTTP01 challenge allow-rule are provisioned by the
+# Kyverno ClusterPolicy `add-networkpolicy` (coopTilleuls/fluxcd), triggered by the
+# `les-tilleuls.coop/network-policy-default-deny` label Terraform sets on this namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-app
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "otterwiki.selectorLabels" . | nindent 6 }}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          service: ingress
+    ports:
+    - protocol: TCP
+      port: {{ .Values.service.port }}
+  egress:
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+    ports:
+    # Vers Google OAuth2 (AUTH_METHOD: OAUTH2)
+    - protocol: TCP
+      port: 443
+    # Vers SMTP (notifications par mail)
+    - protocol: TCP
+      port: {{ .Values.config.MAIL_PORT | default 465 }}
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
