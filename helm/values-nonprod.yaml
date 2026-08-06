@@ -1,0 +1,30 @@
+# Overlay for the lt-mut-nonprod-scw cluster / nonprod-wiki namespace.
+# Used to test future OtterWiki image upgrades before rolling them out to prod.
+# Usage: helm upgrade --install otter-wiki . --values ./values.yaml --values ./values-nonprod.yaml --set ...
+image:
+  repository: ghcr.io/cooptilleuls/otterwiki
+  tag: t1.9.2
+
+imagePullSecrets:
+  - name: regcred
+
+ingress:
+  enabled: false
+
+envFromSecret:
+  secretName: google-auth
+
+# No per-host TLS needed: the shared Traefik Gateway on this cluster terminates
+# with a wildcard cert for *.lt-mut-nonprod-scw.les-tilleuls.solutions.
+route:
+  host: wiki.lt-mut-nonprod-scw.les-tilleuls.solutions
+
+config:
+  SITE_NAME: wiki-nonprod
+  AUTH_METHOD: OAUTH2
+  DISABLE_REGISTRATION: "true"
+  GOOGLE_AUTH_DOMAIN: les-tilleuls.coop
+  ATTACHMENT_ACCESS: APPROVED
+  READ_ACCESS: REGISTERED
+  WRITE_ACCESS: REGISTERED
+  COMMIT_MESSAGE: OPTIONAL
