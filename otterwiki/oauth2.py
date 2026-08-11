@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 import os
 import json
+import secrets
 import requests
-from flask import redirect, request, url_for
+from flask import abort, redirect, request, session, url_for
 from oauthlib.oauth2 import WebApplicationClient
 from otterwiki.server import app
 from otterwiki.auth import auth_manager
@@ -13,33 +14,46 @@ OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", None)
 GOOGLE_DISCOVERY_URL = (
     "https://accounts.google.com/.well-known/openid-configuration"
 )
+REQUESTS_TIMEOUT = 10
 
-
-# OAuth 2 client setup
-client = WebApplicationClient(OAUTH_CLIENT_ID)
 
 def get_google_provider_cfg():
-    return requests.get(GOOGLE_DISCOVERY_URL).json()
+    return requests.get(GOOGLE_DISCOVERY_URL, timeout=REQUESTS_TIMEOUT).json()
 
 @app.route("/-/oauth2_login")
 def oauth2_login():
+    # a fresh client per request, oauthlib stores token state on the
+    # instance so a module level singleton would be shared (and mutated)
+    # by concurrent logins
+    client = WebApplicationClient(OAUTH_CLIENT_ID)
     # Find out what URL to hit for Google login
     google_provider_cfg = get_google_provider_cfg()
     authorization_endpoint = google_provider_cfg["authorization_endpoint"]
+
+    # random state, checked against the callback to prevent login CSRF
+    state = secrets.token_urlsafe(32)
+    session["oauth2_state"] = state
 
     # Use library to construct the request for Google login and provide
     # scopes that let you retrieve user's profile from Google
     request_uri = client.prepare_request_uri(
         authorization_endpoint,
         hosted_domain=os.environ.get("GOOGLE_AUTH_DOMAIN", None),
-        redirect_uri=request.base_url.replace("oauth2_login","gcp_login/callback"),
+        redirect_uri=url_for("gcp_callback", _external=True),
         scope=["openid", "email", "profile"],
+        state=state,
     )
-    print(request_uri)
     return redirect(request_uri)
 
 @app.route("/-/gcp_login/callback")
 def gcp_callback():
+    # verify the state to make sure this callback belongs to a login
+    # we initiated ourselves
+    expected_state = session.pop("oauth2_state", None)
+    if not expected_state or expected_state != request.args.get("state"):
+        abort(400, description="Invalid or missing OAuth2 state.")
+
+    client = WebApplicationClient(OAUTH_CLIENT_ID)
     # Get authorization code Google sent back to you
     code = request.args.get("code")
     # Find out what URL to hit to get tokens that allow you to ask for
@@ -50,7 +64,7 @@ def gcp_callback():
     token_url, headers, body = client.prepare_token_request(
         token_endpoint,
         authorization_response=request.url,
-        redirect_url=request.base_url,
+        redirect_url=url_for("gcp_callback", _external=True),
         code=code
     )
 
@@ -59,13 +73,14 @@ def gcp_callback():
         headers=headers,
         data=body,
         auth=(OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET),
+        timeout=REQUESTS_TIMEOUT,
     )
 
     # Parse the tokens!
     response = token_response.json()
     if 'error' in response.keys():
-        print(type(response))
-        return f"Error from Oauth  serveur : {response}.", 400
+        app.logger.error(f"oauth2: error from token endpoint: {response}")
+        return "Error logging in with Google.", 400
 
     client.parse_request_body_response(json.dumps(response))
     # Now that you have tokens (yay) let's find and hit the URL
@@ -73,7 +88,9 @@ def gcp_callback():
     # including their Google profile image and email
     userinfo_endpoint = google_provider_cfg["userinfo_endpoint"]
     uri, headers, body = client.add_token(userinfo_endpoint)
-    userinfo_response = requests.get(uri, headers=headers, data=body)
+    userinfo_response = requests.get(
+        uri, headers=headers, data=body, timeout=REQUESTS_TIMEOUT
+    )
     # You want to make sure their email is verified.
     # The user authenticated with Google, authorized your
     user_info = userinfo_response.json()
@@ -90,7 +107,7 @@ def gcp_callback():
         return "User email not available or not verified by Google.", 400
     # Create a user in your db with the information provided
     # by Google
-    user = auth_manager.handle_login(
+    auth_manager.handle_login(
         id=unique_id, name=users_name, email=users_email, profile_pic=picture
     )
     return redirect("/")

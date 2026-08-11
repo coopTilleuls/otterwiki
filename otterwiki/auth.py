@@ -59,8 +59,10 @@ def check_password_hash_backport(pwhash, password):
 
 
 class SimpleAuth:
-    class User(UserMixin, UserModel):
+    class SimpleAuthUser(UserMixin, UserModel):
         pass
+
+    User = SimpleAuthUser
 
     def user_loader(self, id):
         return self.User.query.filter_by(id=int(id)).first()
@@ -651,8 +653,10 @@ class ProxyHeaderAuth:
 
 class OAuth2:
 
-    class User(UserMixin, UserModel):
+    class OAuth2User(UserMixin, UserModel):
         pass
+
+    User = OAuth2User
 
     def handle_login(self,id , name, email, profile_pic):
         if len(self.User.query.all()) < 1:
