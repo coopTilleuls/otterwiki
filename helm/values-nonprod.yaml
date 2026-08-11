@@ -3,7 +3,7 @@
 # Usage: helm upgrade --install otter-wiki . --values ./values.yaml --values ./values-nonprod.yaml --set ...
 image:
   repository: ghcr.io/cooptilleuls/otterwiki
-  tag: t1.9.2
+  tag: t1.9.3
 
 imagePullSecrets:
   - name: regcred
