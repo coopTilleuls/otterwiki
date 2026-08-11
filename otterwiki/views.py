@@ -2,6 +2,7 @@
 # vim: set et ts=8 sts=4 sw=4 ai:
 
 import os
+from timeit import default_timer as timer
 
 from flask import (
     request,
@@ -11,6 +12,8 @@ from flask import (
     make_response,
     redirect,
     url_for,
+    jsonify,
+    g,
 )
 from otterwiki.server import app, githttpserver
 from otterwiki.wiki import (
@@ -21,6 +24,7 @@ from otterwiki.wiki import (
 )
 from otterwiki.sitemap import sitemap as generate_sitemap
 from otterwiki.pageindex import PageIndex
+from otterwiki.sidebar import SidebarPageIndex, SidebarMenu
 import otterwiki.auth
 import otterwiki.preferences
 import otterwiki.tools
@@ -31,9 +35,17 @@ from otterwiki.helper import (
     get_pagename_prefixes,
 )
 from otterwiki.version import __version__
-from otterwiki.util import sanitize_pagename
+from otterwiki.util import (
+    sanitize_pagename,
+    compute_webhook_hash,
+    compute_webhook_hash_legacy,
+)
+from otterwiki.plugins import call_hook, collect_hook
+import otterwiki.pluginmgmt
 
 from flask_login import login_required
+from otterwiki.server import csrf
+from flask_wtf.csrf import CSRFError
 
 
 #
@@ -41,7 +53,16 @@ from flask_login import login_required
 #
 @app.route("/")
 def index():
-    return view()
+    home_page = app.config.get("HOME_PAGE", "")
+
+    if not home_page:
+        return view()
+
+    # special page (starts with /-/) - redirect
+    if home_page.startswith("/-/"):
+        return redirect(home_page)
+
+    return view(path=home_page)
 
 
 @app.route("/robots.txt")
@@ -69,9 +90,57 @@ def sitemap():
 def favicon():
     return send_from_directory(
         os.path.join(app.root_path, "static/img"),
-        "otter-favicon2.ico",
+        "otter-favicon.ico",
         mimetype="image/vnd.microsoft.icon",
     )
+
+
+@app.route("/manifest.webmanifest")
+def webmanifest():
+    return jsonify(
+        {
+            "name": (
+                app.config['SITE_NAME']
+                if app.config['SITE_NAME']
+                else "An Otter Wiki"
+            ),
+            "icons": [
+                {
+                    "src": url_for(
+                        "static",
+                        filename="img/otterhead-up-192.png",
+                        _external=True,
+                    ),
+                    "type": "image/png",
+                    "sizes": "192x192",
+                },
+                {
+                    "src": url_for(
+                        "static",
+                        filename="img/otterhead-up-512.png",
+                        _external=True,
+                    ),
+                    "type": "image/png",
+                    "sizes": "512x512",
+                },
+                {
+                    "src": url_for(
+                        "static",
+                        filename="img/otterhead-up-512-maskable.png",
+                        _external=True,
+                    ),
+                    "type": "image/png",
+                    "sizes": "512x512",
+                    "purpose": "maskable",
+                },
+            ],
+        }
+    )
+
+
+@app.route("/.well-known/change-password")
+def well_known_change_password():
+    return redirect(url_for("settings"))
 
 
 @app.route("/-/healthz")
@@ -91,11 +160,13 @@ def healthz():
 def about():
     with open(os.path.join(app.root_path, "about.md")) as f:
         content = f.read()
-    htmlcontent, _ = render.markdown(content)
+    htmlcontent, _, library_requirements = render.markdown(content)
     return render_template(
         "about.html",
+        title="About",
         htmlcontent=htmlcontent,
         __version__=__version__,
+        library_requirements=library_requirements,
     )
 
 
@@ -103,7 +174,9 @@ def about():
 def syntax():
     return render_template(
         "syntax.html",
+        title="Syntax",
         in_help=True,
+        pagepath="",
     )
 
 
@@ -112,10 +185,11 @@ def syntax():
 def help(topic=None):
     toc = None
     content = "TODO"
+    library_requirements = {}
     if topic == "admin":
         with open(os.path.join(app.root_path, "help_admin.md")) as f:
             md = f.read()
-            content, toc = render.markdown(md)
+            content, toc, library_requirements = render.markdown(md)
     elif topic == "syntax":
         toc = [
             (None, '', 2, s, s.lower())
@@ -135,13 +209,38 @@ def help(topic=None):
                 'Diagrams',
             ]
         ]
-        return render_template("help_syntax.html", toc=toc, in_help=True)
+        # embeddings info
+
+        embedding_info = otterwiki.pluginmgmt.collect_plugin_info(
+            category="Syntax/Embeddings"
+        )
+        return render_template(
+            "help_syntax.html",
+            title="Help - Syntax",
+            toc=toc,
+            in_help=True,
+            embedding_info=embedding_info,
+        )
+    elif topic == "plugins":
+        content, toc, library_requirements = (
+            otterwiki.pluginmgmt.generate_help()
+        )
     else:
         with open(os.path.join(app.root_path, "help.md")) as f:
             md = f.read()
-            content, toc = render.markdown(md)
+            content, toc, library_requirements = render.markdown(md)
+    extra_js = "".join(collect_hook("renderer_javascript"))
+    if len(extra_js):
+        extra_js = f"<script type=\"text/javascript\">{extra_js}</script>"
     # default help
-    return render_template("help.html", content=content, toc=toc)
+    return render_template(
+        "help.html",
+        title="Help - {}".format(topic.capitalize()) if topic else "Help",
+        content=content,
+        toc=toc,
+        library_requirements=library_requirements,
+        extra_js=extra_js,
+    )
 
 
 @app.route("/-/settings", methods=["POST", "GET"])
@@ -160,6 +259,18 @@ def housekeeping():
         return otterwiki.tools.housekeeping_form()
     else:
         return otterwiki.tools.handle_housekeeping(request.form)
+
+
+@app.route("/-/housekeeping/security-check", methods=["GET"])
+@login_required
+def security_check():
+    from otterwiki.auth import has_permission
+    from otterwiki.security_check import run_backend_checks
+
+    if not has_permission("ADMIN"):
+        abort(403)
+
+    return jsonify(run_backend_checks())
 
 
 @app.route(
@@ -209,6 +320,17 @@ def admin_content_and_editing():
 
 
 @app.route(
+    "/-/admin/repository_management", methods=["POST", "GET"]
+)  # pyright: ignore -- false positive
+@login_required
+def admin_repository_management():
+    if request.method == "GET":
+        return otterwiki.preferences.repository_management_form()
+    else:
+        return otterwiki.preferences.handle_repository_management(request.form)
+
+
+@app.route(
     "/-/admin/mail_preferences", methods=["POST", "GET"]
 )  # pyright: ignore -- false positive
 @login_required
@@ -255,13 +377,17 @@ def changelog(revision=None):
 @app.route("/-/changelog/feed.rss")
 def changelog_feed_rss():
     chlg = Changelog()
-    return chlg.feed_rss()
+    response = make_response(chlg.feed_rss())
+    response.headers['Content-Type'] = 'application/rss+xml; charset=utf-8'
+    return response
 
 
 @app.route("/-/changelog/feed.atom")
 def changelog_feed_atom():
     chlg = Changelog()
-    return chlg.feed_atom()
+    response = make_response(chlg.feed_atom())
+    response.headers['Content-Type'] = 'application/atom+xml; charset=utf-8'
+    return response
 
 
 @app.route("/-/index")
@@ -280,6 +406,8 @@ def create():
             "create.html",
             title="Create Page",
             pagename_prefixes=get_pagename_prefixes(),
+            menutree=SidebarPageIndex("/").query(),
+            custom_menu=SidebarMenu().query(),
         )
     elif pagename != pagename_sanitized:
         if pagename is not None and pagename != pagename_sanitized:
@@ -289,6 +417,8 @@ def create():
             title="Create Page",
             pagename=pagename_sanitized,
             pagename_prefixes=get_pagename_prefixes(),
+            menutree=SidebarPageIndex("/").query(),
+            custom_menu=SidebarMenu().query(),
         )
     else:
         # this is the creation of a new page
@@ -404,6 +534,7 @@ def rename(path):
             new_pagename=request.form.get("new_pagename"),
             message=request.form.get("message"),
             author=otterwiki.auth.get_author(),
+            update_backlinks=request.form.get("update_backlinks"),
         )
     return p.rename_form()
 
@@ -596,6 +727,7 @@ def dotgit():
 
 
 @app.route("/.git/info/refs", methods=["POST", "GET"])
+@csrf.exempt
 def git_info_refs():
     service = request.args.get("service")
     if service in ["git-upload-pack", "git-receive-pack"]:
@@ -605,10 +737,115 @@ def git_info_refs():
 
 
 @app.route("/.git/git-upload-pack", methods=["POST"])
+@csrf.exempt
 def git_upload_pack():
     return githttpserver.git_upload_pack(request.stream)
 
 
 @app.route("/.git/git-receive-pack", methods=["POST"])
+@csrf.exempt
 def git_receive_pack():
     return githttpserver.git_receive_pack(request.stream)
+
+
+@app.route("/-/api/v1/pull/<string:webhook_hash>", methods=["POST", "GET"])
+@csrf.exempt
+def pull_webhook(webhook_hash):
+    """
+    Webhook endpoint for triggering git pulls from remote repositories.
+    The webhook_hash should match the HMAC-SHA256 hash generated from remote_url using SECRET_KEY.
+    """
+    from otterwiki.repomgmt import get_repo_manager
+
+    if not app.config.get('GIT_REMOTE_PULL_ENABLED'):
+        abort(404)
+
+    remote_url = app.config.get('GIT_REMOTE_PULL_URL')
+    if not remote_url:
+        abort(404)
+
+    if app.config.get('GIT_REMOTE_PULL_URL_SECURE'):
+        expected_hash = compute_webhook_hash(
+            app.config['SECRET_KEY'], remote_url
+        )
+    else:
+        expected_hash = compute_webhook_hash_legacy(remote_url)
+
+    if webhook_hash != expected_hash:
+        abort(404)
+
+    repo_manager = get_repo_manager()
+    success = repo_manager.auto_pull_webhook() if repo_manager else False
+
+    if success:
+        return jsonify(
+            {"status": "success", "message": "Pull triggered successfully"}
+        )
+    else:
+        return (
+            jsonify({"status": "error", "message": "Failed to trigger pull"}),
+            500,
+        )
+
+
+@app.route("/-/plugin/<string:name>/<string:extra>", methods=["POST", "GET"])
+def plugin_url_request(name, extra):
+    result = call_hook(
+        "url_request", plugin=name, extra=extra, values=request.values
+    )
+    if not result:
+        abort(404)
+    return result
+
+
+@app.route(
+    "/-/admin/plugin/<string:name>/<string:extra>", methods=["POST", "GET"]
+)
+def plugin_url_admin_request(name, extra):
+    if not otterwiki.auth.has_permission("ADMIN"):
+        abort(403)
+    result = call_hook(
+        "url_admin_request", plugin=name, extra=extra, valuies=request.values
+    )
+    if not result:
+        abort(404)
+    return result
+
+
+@app.route("/-/plugin-static.css")
+def plugin_static_css():
+    static_css = g.get("plugin_static_css")
+    if static_css is None:
+        t_start = timer()
+        static_css = "" + "\n".join(collect_hook("static_css"))
+        if timer() - t_start > 0.05:
+            app.logger.info(
+                f"Generating plugin_static_css took {timer() - t_start:.3f}s."
+            )
+        g.plugin_static_css = static_css
+    response = make_response(
+        static_css,
+        200,
+    )
+    response.mimetype = "text/css"
+    response.headers['Cache-Control'] = "max-age=300"
+    return response
+
+
+#
+# Error handling
+#
+
+
+@app.errorhandler(CSRFError)
+def handle_csrf_error(e):
+    app.logger.warning(f"CSRF Error: {e.description} url: {request.url}")
+    return (
+        f"""<!doctype html>
+<html lang=en>
+<title>400 Bad Request</title>
+<h1>Bad Request</h1>
+<p>{e.description}</p>
+""",
+        400,
+    )

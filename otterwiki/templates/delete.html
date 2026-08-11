@@ -1,7 +1,20 @@
 {# vim: set et ts=8 sts=4 sw=4 ai: #}
 {% extends "form.html" %}
+{% block menu %}
+{{ super() }}
+{% include 'snippets/menu.html' %}
+{% include 'snippets/menutree.html' %}
+{% endblock %}
+{%- block navbardropdown %}
+{%- include 'snippets/navbardropdown_page_tools.html' %}
+{{ super() }}
+{%- endblock %}
+{%- block navbar %}
+{%- include 'snippets/navbar_edit_button.html' %}
+{%- endblock %}
 {% block formcontent %}
 <form action="{{url_for("delete", path=pagepath )}}" method="POST" class="form-inline">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <div class="form-group">
     <label for="message" class="w-150">Commit message</label>
     <input type="text" class="form-control" name="message" id="message" placeholder="Deleted {{pagename}}." value="{{message}}">

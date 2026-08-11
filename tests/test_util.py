@@ -4,6 +4,7 @@
 import os
 import pytest
 from otterwiki.util import (
+    sha256sum,
     sizeof_fmt,
     slugify,
     split_path,
@@ -39,6 +40,19 @@ def test_slugigy():
     assert slugify("a b c") == "a-b-c"
     assert slugify("a    b") == "a-b"
     assert slugify("äüöÄÜÖß") == "auoauo"
+    # test keep_slashes=True for use with pagepath
+    assert slugify("abc", keep_slashes=True) == "abc"
+    assert (
+        slugify("Some Random Sub/with/A page", keep_slashes=True)
+        == "some-random-sub/with/a-page"
+    )
+    assert (
+        slugify("Multiple    Spaces", keep_slashes=True) == "multiple-spaces"
+    )
+    assert (
+        slugify("With Trailing Slash/", keep_slashes=True)
+        == "with-trailing-slash/"
+    )
 
 
 def test_split_path():
@@ -104,6 +118,12 @@ def test_sanitize_pagename():
     assert sanitize_pagename("😊") == "😊"
     assert sanitize_pagename("\\\\abc") == "abc"
     assert sanitize_pagename("abc", allow_unicode=False) == "abc"
+    assert sanitize_pagename("IT/SystemD") == "IT/SystemD"
+    assert sanitize_pagename("IT/SystemD.md") == "IT/SystemDmd"
+    # test handle_md (issue #344)
+    assert sanitize_pagename("IT/SystemD", handle_md=True) == "IT/SystemD"
+    assert sanitize_pagename("IT/Systemd", handle_md=True) == "IT/Systemd"
+    assert sanitize_pagename("IT/Systemd.md", handle_md=True) == "IT/Systemd"
 
 
 def test_random_password():
@@ -149,6 +169,9 @@ def test_titleSs():
     )
     assert "\"Foobarß\"" == titleSs("\"foobarß\"")
     assert "Foobarß" == titleSs("foobarß")
+    assert "Page's Title" == titleSs("page's title")
+    assert "Don't Stop" == titleSs("don't stop")
+    assert "It's Foobarß" == titleSs("it's foobarß")
 
 
 def test_patchset2filedict():
@@ -258,3 +281,18 @@ def test_int_or_None():
     assert int_or_None(False) == 0
     assert int_or_None(10.9) == 10
     assert int_or_None(2.7) == 2
+
+
+def test_sha256sum():
+    assert (
+        sha256sum("")
+        == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    )
+    assert (
+        sha256sum("\n")
+        == "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    )
+    assert (
+        sha256sum("An Otter Wiki")
+        == "c0b00e171401dfa2c70f2524fa977d66ead451ec9837543556fc66087b211646"
+    )

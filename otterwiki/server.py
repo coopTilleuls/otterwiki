@@ -9,6 +9,7 @@ import logging
 from flask import Flask
 from flask_mail import Mail
 from flask_sqlalchemy import SQLAlchemy
+from flask_wtf.csrf import CSRFProtect
 
 import otterwiki.gitstorage
 import otterwiki.util
@@ -26,14 +27,20 @@ app.config.update(
     SECRET_KEY="CHANGE ME",
     SITE_NAME="An Otter Wiki",
     SITE_DESCRIPTION=None,
+    SERVER_NAME=None,
     SITE_LOGO=None,
     SITE_ICON=None,
     SITE_LANG="en",
     HIDE_LOGO=False,
+    OPEN_LINKS_IN_NEW_TAB=False,
     AUTH_METHOD="",
     AUTH_HEADERS_USERNAME="x-otterwiki-name",
     AUTH_HEADERS_EMAIL="x-otterwiki-email",
     AUTH_HEADERS_PERMISSIONS="x-otterwiki-permissions",
+    AUTH_ROLES_READ="READ",
+    AUTH_ROLES_WRITE="WRITE",
+    AUTH_ROLES_UPLOAD="UPLOAD",
+    AUTH_ROLES_ADMIN="ADMIN",
     READ_ACCESS="ANONYMOUS",
     WRITE_ACCESS="ANONYMOUS",
     ATTACHMENT_ACCESS="ANONYMOUS",
@@ -59,7 +66,15 @@ app.config.update(
     SIDEBAR_MENUTREE_FOCUS="SUBTREE",  # OFF
     SIDEBAR_CUSTOM_MENU="",
     COMMIT_MESSAGE="REQUIRED",  # OPTIONAL DISABLED
+    DEFAULT_COMMIT_MESSAGE="",
     GIT_WEB_SERVER=False,
+    GIT_REMOTE_PUSH_ENABLED=False,
+    GIT_REMOTE_PUSH_URL="",
+    GIT_REMOTE_PUSH_PRIVATE_KEY="",
+    GIT_REMOTE_PULL_ENABLED=False,
+    GIT_REMOTE_PULL_URL="",
+    GIT_REMOTE_PULL_URL_SECURE=False,
+    GIT_REMOTE_PULL_PRIVATE_KEY="",
     SIDEBAR_SHORTCUTS="home pageindex createpage",
     ROBOTS_TXT="allow",
     WIKILINK_STYLE="",
@@ -68,6 +83,13 @@ app.config.update(
     HTML_EXTRA_BODY="",
     LOG_LEVEL_WERKZEUG="INFO",
     TREAT_UNDERSCORE_AS_SPACE_FOR_TITLES=False,
+    HOME_PAGE="",
+    RENDERER_HTML_ALLOWLIST="",
+    ADMIN_USER_EMAIL="",
+    SESSION_COOKIE_SAMESITE="Lax",
+    SECURITY_HEADERS=True,
+    WTF_CSRF_ENABLED=True,
+    WTF_CSRF_TIME_LIMIT=86400,
 )
 app.config.from_envvar("OTTERWIKI_SETTINGS", silent=True)
 
@@ -77,7 +99,10 @@ print(
     file=sys.stderr,
 )
 
-# check if any config option exists as environment variable
+# check if any config option exists as environment variable, remember
+# which options were set via the environment, so that overrides by
+# database preferences can be warned about in update_app_config()
+config_from_environment = {}
 for key in app.config:
     if key in os.environ:
         if type(app.config[key]) == bool:
@@ -89,6 +114,7 @@ for key in app.config:
             ]
         else:
             app.config[key] = os.environ[key]
+        config_from_environment[key] = app.config[key]
 
 # configure logging
 app.logger.setLevel(app.config["LOG_LEVEL"])
@@ -106,6 +132,9 @@ if (
         "Please configure a random SECRET_KEY with a length of at least 16 characters."
     )
 
+# enable CSRF protection globally
+csrf = CSRFProtect(app)
+
 # setup storage
 if app.config["REPOSITORY"] is None:
     fatal_error("Please configure a REPOSITORY path.")
@@ -122,23 +151,43 @@ else:
         fatal_error(e)
 
 
+# make sure SERVER_NAME is None if empty (to make url_for work)
+if otterwiki.util.empty(app.config["SERVER_NAME"]):
+    app.config["SERVER_NAME"] = None
+
 # check if the git repository is empty
 if (len(storage.list()[0]) < 1) and (  # pyright: ignore never unbound
     len(storage.log()) < 1  # pyright: ignore
 ):
-    # we have a brand new repository here
-    with open(os.path.join(app.root_path, "initial_home.md")) as f:
-        content = f.read()
-        filename = (
-            "Home.md" if app.config["RETAIN_PAGE_NAME_CASE"] else "home.md"
-        )
-        storage.store(  # pyright: ignore
-            filename=filename,
-            content=content,
-            author=("Otterwiki Robot", "noreply@otterwiki"),
-            message="Initial commit",
-        )
-        app.logger.info("server: Created initial /Home.")
+    home_page_config = app.config.get("HOME_PAGE", "")
+
+    # only create initial page if HOME_PAGE is empty or doesn't start with /-/
+    if not home_page_config or not home_page_config.startswith("/-/"):
+        with open(os.path.join(app.root_path, "initial_home.md")) as f:
+            content = f.read()
+
+            if not home_page_config:
+                # use the default Home page
+                filename = (
+                    "Home.md"
+                    if app.config["RETAIN_PAGE_NAME_CASE"]
+                    else "home.md"
+                )
+            else:
+                # use the custom page path from HOME_PAGE
+                custom_path = home_page_config.strip("/")
+                if app.config["RETAIN_PAGE_NAME_CASE"]:
+                    filename = f"{custom_path}.md"
+                else:
+                    filename = f"{custom_path.lower()}.md"
+
+            storage.store(  # pyright: ignore
+                filename=filename,
+                content=content,
+                author=("Otterwiki Robot", "noreply@otterwiki"),
+                message="Initial commit",
+            )
+            app.logger.info(f"server: Created initial page /{filename[:-3]}.")
 
 
 #
@@ -164,7 +213,11 @@ def update_app_config():
                 "RETAIN_PAGE_NAME_CASE",
                 "SIDEBAR_MENUTREE_IGNORE_CASE",
                 "GIT_WEB_SERVER",
+                "GIT_REMOTE_PUSH_ENABLED",
+                "GIT_REMOTE_PULL_ENABLED",
+                "GIT_REMOTE_PULL_URL_SECURE",
                 "HIDE_LOGO",
+                "OPEN_LINKS_IN_NEW_TAB",
                 "TREAT_UNDERSCORE_AS_SPACE_FOR_TITLES",
             ] or item.name.upper().startswith("SIDEBAR_SHORTCUT_"):
                 item.value = item.value.lower() in ["true", "yes"]
@@ -177,6 +230,16 @@ def update_app_config():
                             item.name, item.value
                         )
                     )
+            # warn if a database preference overrides a value that was
+            # set via an environment variable
+            if item.name in config_from_environment and str(item.value) != str(
+                config_from_environment[item.name]
+            ):
+                app.logger.warning(
+                    "server: app.config[\"{}\"] set via environment"
+                    " variable is overridden by the database"
+                    " preference".format(item.name)
+                )
             # update app settings
             app.config[item.name] = item.value
         # setup flask_mail
@@ -205,8 +268,8 @@ for plugin, dist in plugininfo:
     )
 # setup plugins
 plugin_manager.hook.setup(
-    app=app, storage=storage, db=db
-)  # pyright: ignore never unbound
+    app=app, storage=storage, db=db  # pyright: ignore never unbound
+)
 
 
 #
@@ -267,15 +330,81 @@ def format_datetime(value: datetime.datetime, format="medium") -> str:
     return value.strftime(format)
 
 
+@app.template_filter('slugify')
+def slugify(s, keep_slashes=True):
+    """
+    Example usage:
+
+    {{ pagepath | slugify(keep_slashes=True) }}.
+    """
+
+    return otterwiki.util.slugify(s, keep_slashes=keep_slashes)
+
+
 app.jinja_env.globals.update(os_getenv=os.getenv)
+
+
+@app.after_request
+def set_security_headers(response):
+    if app.config['SECURITY_HEADERS']:
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['X-Frame-Options'] = 'SAMEORIGIN'
+        response.headers['Referrer-Policy'] = 'same-origin'
+    return response
+
+
+from otterwiki.helper import load_custom_html
+
+
+def plugin_html_head_inject(page=None):
+    """Template function to inject HTML into the head section via plugins."""
+    results = plugin_manager.hook.template_html_head_inject(page=page)
+    return ''.join(result for result in results if result)
+
+
+def plugin_html_body_inject(page=None):
+    """Template function to inject HTML into the body section via plugins."""
+    results = plugin_manager.hook.template_html_body_inject(page=page)
+    return ''.join(result for result in results if result)
+
+
+def plugin_sidebar_left_inject(page=None):
+    """Template function to inject HTML into the left sidebar via plugins."""
+    results = plugin_manager.hook.template_html_sidebar_left_inject(page=page)
+    return ''.join(result for result in results if result)
+
+
+def plugin_sidebar_right_inject(page=None):
+    """Template function to inject HTML into the right sidebar via plugins."""
+    results = plugin_manager.hook.template_html_sidebar_right_inject(page=page)
+    return ''.join(result for result in results if result)
+
+
+app.jinja_env.globals.update(
+    load_custom_html=load_custom_html,
+    plugin_html_head_inject=plugin_html_head_inject,
+    plugin_html_body_inject=plugin_html_body_inject,
+    plugin_sidebar_left_inject=plugin_sidebar_left_inject,
+    plugin_sidebar_right_inject=plugin_sidebar_right_inject,
+)
 
 # initialize git via http
 import otterwiki.remote
 
 githttpserver = otterwiki.remote.GitHttpServer(path=app.config["REPOSITORY"])
 
+# initialize repository management stuff
+import otterwiki.repomgmt
+
+otterwiki.repomgmt.initialize_repo_management(
+    storage  # pyright: ignore never unbound
+)
+
 # contains application routes,
 # using side-effect of import executing the file to get
 import otterwiki.views  # pyright: ignore
 if app.config.get("AUTH_METHOD") == "OAUTH2":
     import otterwiki.oauth2
+
+# register CLI commands
+import otterwiki.cli  # pyright: ignore

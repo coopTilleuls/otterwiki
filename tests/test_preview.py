@@ -48,6 +48,12 @@ a^2+b^2=c^2
 [[Text to display|WikiPage]]
 
 [Example Link with text](http://example.com)
+
+
+:::danger
+Test
+:::
+
 """
 
 """
@@ -66,7 +72,7 @@ def test_preview(create_app, req_ctx):
 def test_preview_all(create_app, req_ctx):
     whitespace = re.compile(r"\s+")
     markdown_arr = markdown_example.splitlines()
-    html_example, _ = render.markdown(markdown_example)
+    html_example, _, _ = render.markdown(markdown_example)
     html_example_soup = bs4.BeautifulSoup(html_example, "html.parser")
     from otterwiki.wiki import Page
 
@@ -144,10 +150,85 @@ def test_preview_cursor_in_codeblock(create_app, req_ctx):
     code in block
     ```
     """
-    data = p.preview(content=content, cursor_line=1)
-    soup = bs4.BeautifulSoup(data['preview_content'], "html.parser").find(
+    data = p.preview(content=content, cursor_line=2)
+    soup = bs4.BeautifulSoup(str(data['preview_content']), "html.parser").find(
         "pre"
     )
     assert soup
     text = soup.text.strip("`\n")
-    assert "code in block" == text
+    # the "  " are an artifact from the html cursor and expected
+    assert "code in block  " == text
+
+
+def test_preview_cursor_in_abbr(create_app, req_ctx):
+    from otterwiki.wiki import Page
+
+    p = Page("test")
+    content = """*[HTML]: Hypertext Markup Language
+*[CSS]: Cascading Style Sheets
+
+HTML and CSS are essential web technologies.
+"""
+
+    data = p.preview(content=content, cursor_line=0)
+    assert data and data['preview_content']
+    soup = bs4.BeautifulSoup(str(data['preview_content']), "html.parser").find(
+        "div", class_="page"
+    )
+    assert soup and soup.text
+    # the "   " are an artifact from the html cursor and expected
+    assert "HTML and   CSS are essential web technologies." in soup.text
+
+
+def test_preview_cursor_in_images(create_app, req_ctx):
+    from otterwiki.wiki import Page
+
+    p = Page("test")
+    # pasting a bunch of images: the lines end with ')' and have no
+    # trailing word, the cursor must still land in the image block and
+    # not jump to the top of the document
+    content = """# Header
+
+Some intro paragraph.
+
+![img1](/a/image1.png)
+![img2](/a/image2.png)
+![img3](/a/image3.png)
+"""
+    data = p.preview(content=content, cursor_line=6)
+    assert data and data['preview_content']
+    assert render.htmlcursor in data['preview_content']
+    # the cursor must be placed in the paragraph holding the images,
+    # not prepended at the top of the document
+    soup = bs4.BeautifulSoup(str(data['preview_content']), "html.parser")
+    cursor = soup.find("span", {"id": "otterwiki_cursor"})
+    assert cursor
+    parent = cursor.find_parent("p")
+    assert parent and parent.find("img")
+
+
+def test_preview_cursor_in_links(create_app, req_ctx):
+    from otterwiki.wiki import Page
+
+    p = Page("test")
+    # pasting links in a list: the lines end with ')' and have no
+    # trailing word, the cursor must still land in the list and not jump
+    # to the top of the document
+    content = """# Header
+
+Some intro paragraph.
+
+- [link1](http://example.com/one)
+- [link2](http://example.com/two)
+- [link3](http://example.com/three)
+"""
+    data = p.preview(content=content, cursor_line=6)
+    assert data and data['preview_content']
+    assert render.htmlcursor in data['preview_content']
+    # the cursor must be placed in the list item holding the link,
+    # not prepended at the top of the document
+    soup = bs4.BeautifulSoup(str(data['preview_content']), "html.parser")
+    cursor = soup.find("span", {"id": "otterwiki_cursor"})
+    assert cursor
+    parent = cursor.find_parent("li")
+    assert parent and parent.find("a")

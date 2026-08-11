@@ -6,6 +6,606 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
 <!-- insertion marker -->
+
+## [v2.23.0](https://github.com/redimp/otterwiki/releases/tag/v2.23.0) - 2026-08-05
+
+<small>[Compare with v2.22.2](https://github.com/redimp/otterwiki/compare/v2.22.2...v2.23.0)</small>
+
+### Security Fixes
+
+- Escape user-controlled URLs in the ImageFrame and Video embeddings, which
+  allowed stored XSS via attribute breakout. Thanks to @Jellexer for responsibly
+  disclosing this issue
+  ([c8eb5cc](https://github.com/redimp/otterwiki/commit/c8eb5cc)).
+- Escape user-controlled input in renderer plugins and embeddings to prevent
+  stored XSS in FancyBlocks, Fold, Math, Frontmatter and InfoBox
+  ([84b911e](https://github.com/redimp/otterwiki/commit/84b911e)).
+
+### Features
+
+- Update backlinks when a page is renamed, covering WikiLinks, Markdown links
+  and links to attachments. Controlled by a new **Update backlinks** checkbox on
+  the rename page. Implemented by @ribbal, picking up the example plugin
+  @skirmess contributed in #508, see #228 #508 #530
+  (by @ribbal:
+  [e4e2a31](https://github.com/redimp/otterwiki/commit/e4e2a31),
+  [0be30e8](https://github.com/redimp/otterwiki/commit/0be30e8),
+  [3027e8d](https://github.com/redimp/otterwiki/commit/3027e8d),
+  [a964573](https://github.com/redimp/otterwiki/commit/a964573);
+  follow-ups:
+  [7203218](https://github.com/redimp/otterwiki/commit/7203218),
+  [4c8bf54](https://github.com/redimp/otterwiki/commit/4c8bf54),
+  [5b347bd](https://github.com/redimp/otterwiki/commit/5b347bd),
+  [edd146e](https://github.com/redimp/otterwiki/commit/edd146e),
+  [6290ec9](https://github.com/redimp/otterwiki/commit/6290ec9),
+  [d35edc3](https://github.com/redimp/otterwiki/commit/d35edc3)).
+
+### Bug Fixes
+
+- Isolate DataTable initialization so one broken table does not break the others
+  on the page ([a758b3e](https://github.com/redimp/otterwiki/commit/a758b3e)).
+
+### Dependencies
+
+- Bump gitpython from 3.1.55 to 3.1.57, see #548
+  ([b83138c](https://github.com/redimp/otterwiki/commit/b83138c) by
+  @dependabot).
+
+## [v2.22.2](https://github.com/redimp/otterwiki/releases/tag/v2.22.2) - 2026-08-02
+
+<small>[Compare with v2.22.1](https://github.com/redimp/otterwiki/compare/v2.22.1...v2.22.2)</small>
+
+### Security Fixes
+
+- Prevent path traversal via attachment paths and the DataTable embedding `src`
+  option, which allowed reading files outside the wiki repository. Thanks to
+  @NomanProdhan for responsibly disclosing this issue
+  ([62a5336](https://github.com/redimp/otterwiki/commit/62a5336)).
+
+### Dependencies
+
+- Bump gitpython from 3.1.54 to 3.1.55 ([78d6ba6](https://github.com/redimp/otterwiki/commit/78d6ba6)).
+
+## [v2.22.1](https://github.com/redimp/otterwiki/releases/tag/v2.22.1) - 2026-07-30
+
+<small>[Compare with v2.22.0](https://github.com/redimp/otterwiki/compare/v2.22.0...v2.22.1)</small>
+
+### Features
+
+- Add a reset to remote function, see #532 ([f9c34e9](https://github.com/redimp/otterwiki/commit/f9c34e9) by @Getslow6, [fbd088f](https://github.com/redimp/otterwiki/commit/fbd088f) by @Getslow6, [f4ebcf7](https://github.com/redimp/otterwiki/commit/f4ebcf7) by @Getslow6).
+- Parse space and/or comma separated roles for the permission overrides, see #541 ([1b0eff6](https://github.com/redimp/otterwiki/commit/1b0eff6) by @Getslow6).
+
+### Bug Fixes
+
+- Escape URLs reused as link text and href to prevent HTML entity rendering, see #545 ([d7fb717](https://github.com/redimp/otterwiki/commit/d7fb717), [11e01be](https://github.com/redimp/otterwiki/commit/11e01be)).
+
+### Plugins
+
+- Match leading-slash and anchored WikiLinks in the referencing pages example, see #509 #527 ([be4795c](https://github.com/redimp/otterwiki/commit/be4795c)).
+
+### Refactoring
+
+- Tidy up page index alignment and styling, see #539 ([d795dfb](https://github.com/redimp/otterwiki/commit/d795dfb) by @ribbal, [cffc6fa](https://github.com/redimp/otterwiki/commit/cffc6fa) by @ribbal, [e251215](https://github.com/redimp/otterwiki/commit/e251215)).
+
+### Tests
+
+- Isolate storage, database and config per test to stop state leaking across the suite, at the cost of a slower test run ([1c80969](https://github.com/redimp/otterwiki/commit/1c80969), [2514eb2](https://github.com/redimp/otterwiki/commit/2514eb2)).
+
+### Dependencies
+
+- Bump gitpython from 3.1.50 to 3.1.54, see #542 ([70f4846](https://github.com/redimp/otterwiki/commit/70f4846) by @dependabot).
+
+## [v2.22.0](https://github.com/redimp/otterwiki/releases/tag/v2.22.0) - 2026-07-22
+
+<small>[Compare with v2.21.1](https://github.com/redimp/otterwiki/compare/v2.21.1...v2.22.0)</small>
+
+**Security Update**
+
+This release addresses a critical security vulnerability. We strongly recommend
+updating to this version as soon as possible. User-supplied revision parameters
+were passed to git without validation, allowing a revision beginning with `-` to
+be interpreted as a git command-line option. This could be abused to overwrite
+pages or disclose files at the repository root (CWE-88). Thanks to @tonghuaroot
+for responsibly disclosing this issue and bringing it to our attention.
+
+### Security Fixes
+
+- Reject invalid git revisions to prevent argument injection ([799aff4](https://github.com/redimp/otterwiki/commit/799aff4)).
+
+### Features
+
+- Add the possibility to override the roles for the read/write/upload/admin permissions, see #525 ([e4a59e8](https://github.com/redimp/otterwiki/commit/e4a59e8) by @Getslow6, [e132d52](https://github.com/redimp/otterwiki/commit/e132d52) by @Getslow6).
+- Rework the page index: display the full page path for the list-style index, extend the page index title and align the heading toggle, see #534 #538 ([6e52a89](https://github.com/redimp/otterwiki/commit/6e52a89) by @ribbal, [1c71047](https://github.com/redimp/otterwiki/commit/1c71047) by @ribbal, [7b26aeb](https://github.com/redimp/otterwiki/commit/7b26aeb) by @ribbal, [3dfb593](https://github.com/redimp/otterwiki/commit/3dfb593) by @ribbal, [ca36eff](https://github.com/redimp/otterwiki/commit/ca36eff), [d131be2](https://github.com/redimp/otterwiki/commit/d131be2)).
+- Enhance the referencing pages plugin, see #527 ([cad752b](https://github.com/redimp/otterwiki/commit/cad752b) by @ribbal).
+
+### Bug Fixes
+
+- Fix page index alignment, see #531 ([f1a6fd4](https://github.com/redimp/otterwiki/commit/f1a6fd4) by @Getslow6, [cf76708](https://github.com/redimp/otterwiki/commit/cf76708)).
+
+### Dependencies
+
+- Bump pillow from 12.2.0 to 12.3.0, see #536 ([d7e26aa](https://github.com/redimp/otterwiki/commit/d7e26aa) by @dependabot).
+
+## [v2.21.1](https://github.com/redimp/otterwiki/releases/tag/v2.21.1) - 2026-07-12
+
+<small>[Compare with v2.21.0](https://github.com/redimp/otterwiki/compare/v2.21.0...v2.21.1)</small>
+
+### Bug Fixes
+
+- Unescape pipes in table cells like GFM, see #500 ([1af90ef](https://github.com/redimp/otterwiki/commit/1af90ef)).
+- Allow repository management configuration via environment variables, see #522 ([3e3a8df](https://github.com/redimp/otterwiki/commit/3e3a8df)).
+- Fix alignment on the figure embedding, see #523 ([860f0a7](https://github.com/redimp/otterwiki/commit/860f0a7) by @ribbal).
+- Do not create preferences that shadow the environment configuration ([0fd5373](https://github.com/redimp/otterwiki/commit/0fd5373)).
+
+### Dependencies
+
+- Update mistune to 3.3.3 ([dd6909a](https://github.com/redimp/otterwiki/commit/dd6909a)).
+
+## [v2.21.0](https://github.com/redimp/otterwiki/releases/tag/v2.21.0) - 2026-07-04
+
+<small>[Compare with v2.20.8](https://github.com/redimp/otterwiki/compare/v2.20.8...v2.21.0)</small>
+
+### Features: CodeMirror 6
+
+Finally CodeMirror 6 is here. The majority of work has been done by @onovy in #464.
+
+- Migrate the editor from CodeMirror 5 to CodeMirror 6: the vendored CM5 files are replaced
+  by a single bundle built from source with esbuild, all editor features (markdown formatting
+  helpers, table editing, list continuation and indentation, link handling, search dialog,
+  inline attachment upload and preview toggle) have been ported, and GFM support (task lists,
+  strikethrough, tables) is enabled, see #464 #520
+  ([1c76bd9](https://github.com/redimp/otterwiki/commit/1c76bd9), [cd08166](https://github.com/redimp/otterwiki/commit/cd08166), [b8492a4](https://github.com/redimp/otterwiki/commit/b8492a4), [cea3dab](https://github.com/redimp/otterwiki/commit/cea3dab), [aa87116](https://github.com/redimp/otterwiki/commit/aa87116), [13d75bb](https://github.com/redimp/otterwiki/commit/13d75bb), [d1283db](https://github.com/redimp/otterwiki/commit/d1283db) by @onovy).
+- Add syntax highlighting for wikilinks and embeddings in the editor, see #520 ([e1fbc03](https://github.com/redimp/otterwiki/commit/e1fbc03), [403cfce](https://github.com/redimp/otterwiki/commit/403cfce), [c6011e6](https://github.com/redimp/otterwiki/commit/c6011e6)).
+- Highlight trailing whitespace in the editor, see #520 ([2d53b93](https://github.com/redimp/otterwiki/commit/2d53b93)).
+- Use a 4-space indent unit in the editor to match the wiki's markdown conventions, see #520 ([2825582](https://github.com/redimp/otterwiki/commit/2825582)).
+- Enable autocorrect and autocapitalize in the editor on mobile, see #520 ([f852d2d](https://github.com/redimp/otterwiki/commit/f852d2d)).
+
+### Bug Fixes
+
+- Restore visual parity with the CM5 editor in both light and dark themes: nested list depth
+  coloring, grey inline and fenced code, and the checkbox color, see #520
+  ([3b7c05f](https://github.com/redimp/otterwiki/commit/3b7c05f), [c26a8c4](https://github.com/redimp/otterwiki/commit/c26a8c4), [6e8419a](https://github.com/redimp/otterwiki/commit/6e8419a), [0a01cac](https://github.com/redimp/otterwiki/commit/0a01cac), [28a515f](https://github.com/redimp/otterwiki/commit/28a515f), [ff0d7aa](https://github.com/redimp/otterwiki/commit/ff0d7aa), [a422d02](https://github.com/redimp/otterwiki/commit/a422d02) by @onovy).
+- Fix the invisible editor selection in dark mode caused by a CSS specificity issue, see #520 ([8d6d144](https://github.com/redimp/otterwiki/commit/8d6d144) by @onovy).
+- Prevent content duplication when pasting an image in the editor, see #520 ([b0a8acd](https://github.com/redimp/otterwiki/commit/b0a8acd)).
+- Preserve the cursor position when an inline attachment upload completes, see #520 ([764514a](https://github.com/redimp/otterwiki/commit/764514a)).
+- Fix dark mode colors of the DataTable selector dropdown, see #519 ([484211a](https://github.com/redimp/otterwiki/commit/484211a)).
+- Remove accidental globals in otterwiki.js ([5786c57](https://github.com/redimp/otterwiki/commit/5786c57)).
+- Match article headings for the sidebar table of contents highlight ([8629caa](https://github.com/redimp/otterwiki/commit/8629caa)).
+- Use per-platform pip caches in docker builds ([bfc5e73](https://github.com/redimp/otterwiki/commit/bfc5e73)).
+
+### Refactoring
+
+- Move the frontend sources and npm tooling into `frontend/`, see #520 ([483ccdf](https://github.com/redimp/otterwiki/commit/483ccdf)).
+
+### Dependencies
+
+- Bump esbuild from 0.19.12 to 0.28.1 and rebuild the editor bundle, see #521 ([33b5313](https://github.com/redimp/otterwiki/commit/33b5313) by @dependabot, [5fa9962](https://github.com/redimp/otterwiki/commit/5fa9962)).
+
+## [v2.20.8](https://github.com/redimp/otterwiki/releases/tag/v2.20.8) - 2026-07-01
+
+<small>[Compare with v2.20.7](https://github.com/redimp/otterwiki/compare/v2.20.7...v2.20.8)</small>
+
+### Security Fixes
+
+- Reject backslash open-redirect bypass in the login redirect ([7681e4f](https://github.com/redimp/otterwiki/commit/7681e4f)).
+
+### Features
+
+- Add column0 option for 0-based CSV column selection, see #519 ([da90ae8](https://github.com/redimp/otterwiki/commit/da90ae8)).
+
+### Bug Fixes
+
+- Prevent InfoBox overflow on narrow viewports, see #515 ([17ba350](https://github.com/redimp/otterwiki/commit/17ba350)).
+- Use page header capitalization in breadcrumbs, see #516 ([8e36f83](https://github.com/redimp/otterwiki/commit/8e36f83)).
+- Keep post-login redirect relative, see #517 ([f871fef](https://github.com/redimp/otterwiki/commit/f871fef)).
+- Fix saving the page index session state in Safari, see #514 ([9537cf9](https://github.com/redimp/otterwiki/commit/9537cf9) by @ribbal).
+
+### Refactoring
+
+- Limit breadcrumb header read to 512 bytes ([eebf9d2](https://github.com/redimp/otterwiki/commit/eebf9d2)).
+
+## [v2.20.7](https://github.com/redimp/otterwiki/releases/tag/v2.20.7) - 2026-06-20
+
+<small>[Compare with v2.20.6](https://github.com/redimp/otterwiki/compare/v2.20.6...v2.20.7)</small>
+
+### Security Fixes
+
+- Use HMAC with `SECRET_KEY` for the webhook hash, generate the webhook URL server-side,
+  and add `GIT_REMOTE_PULL_URL_SECURE` for backward-compatible hashes, see #443 ([bc77b7d](https://github.com/redimp/otterwiki/commit/bc77b7d) by @onovy).
+- Prevent style attribute XSS in InfoBox, ImageFrame and Figure embeddings ([8c5d311](https://github.com/redimp/otterwiki/commit/8c5d311)).
+- Deny any possibility for malicious redirects, see #504 ([15f5a86](https://github.com/redimp/otterwiki/commit/15f5a86) by @deseven).
+  Thanks to @Fushuling for reaching out and bringing this potential security risk to our attention.
+
+### Features
+
+- Open external links in a new tab with an icon, see #215 #507 ([e18304f](https://github.com/redimp/otterwiki/commit/e18304f) by @ribbal).
+- Allow multiple sub-tree items to be unfolded in the page index, see #512 ([df49a45](https://github.com/redimp/otterwiki/commit/df49a45) by @ribbal).
+
+### Bug Fixes
+
+- Add a TOP focus option and unfold all folders when focus is OFF, see #506 ([0bc25d8](https://github.com/redimp/otterwiki/commit/0bc25d8)).
+- Safely encode DataTable caption using `json.dumps`, see #502 ([8911f1a](https://github.com/redimp/otterwiki/commit/8911f1a) by @turfin-logic).
+- Lowercase crumb paths for `isdir` checks on case-sensitive filesystems ([d5b1bdc](https://github.com/redimp/otterwiki/commit/d5b1bdc)).
+- Fix referencing pages plugin, see #498 ([473ec48](https://github.com/redimp/otterwiki/commit/473ec48) by @ribbal).
+
+## [v2.20.6](https://github.com/redimp/otterwiki/releases/tag/v2.20.6) - 2026-05-31
+
+<small>[Compare with v2.20.5](https://github.com/redimp/otterwiki/compare/v2.20.5...v2.20.6)</small>
+
+### Features
+
+- Use a dedicated og:image meta image ([0f40bfe](https://github.com/redimp/otterwiki/commit/0f40bfe)).
+- Add `style` option to `PageIndexEmbedding` ([1c0b51a](https://github.com/redimp/otterwiki/commit/1c0b51a)).
+
+### Bug Fixes
+
+- Add apple-touch-icon and web manifest for Safari/iOS, see #501 ([08f509e](https://github.com/redimp/otterwiki/commit/08f509e), [2d07352](https://github.com/redimp/otterwiki/commit/2d07352)).
+- Filter non-existing prefixes in create page form, see #491 ([09fffb7](https://github.com/redimp/otterwiki/commit/09fffb7)).
+- Keep Tools menu and Edit button on Rename/Delete forms, see #494 ([02a1d77](https://github.com/redimp/otterwiki/commit/02a1d77)).
+- Show Custom Menu and Page Index consistently in sidebar, see #493 ([4fc19b4](https://github.com/redimp/otterwiki/commit/4fc19b4)).
+- Focus preview so it can be scrolled with page up/down ([7c2e68e](https://github.com/redimp/otterwiki/commit/7c2e68e)).
+- Place preview cursor on lines ending with images or links ([c7c69fa](https://github.com/redimp/otterwiki/commit/c7c69fa)).
+
+### Dependencies
+
+- Upgrade Debian in Docker, see #488 ([7747a8c](https://github.com/redimp/otterwiki/commit/7747a8c) by @onovy).
+
+## [v2.20.5](https://github.com/redimp/otterwiki/releases/tag/v2.20.5) - 2026-05-17
+
+<small>[Compare with v2.20.4](https://github.com/redimp/otterwiki/compare/v2.20.4...v2.20.5)</small>
+
+### Features
+
+- Wrap page content in `<article>` for browser reader mode ([c3ec872](https://github.com/redimp/otterwiki/commit/c3ec872)).
+- Add housekeeping security check, restricted to admins, see #476 ([1109a5a](https://github.com/redimp/otterwiki/commit/1109a5a) by @deseven, [30be0d2](https://github.com/redimp/otterwiki/commit/30be0d2)).
+- Report passed security checks alongside issues, see #476 ([0e4c76e](https://github.com/redimp/otterwiki/commit/0e4c76e)).
+
+### Bug Fixes
+
+- Set autofocus on the main content wrapper ([d6928e0](https://github.com/redimp/otterwiki/commit/d6928e0)).
+- Correct blame link to historic revision, see #484 ([bc38ec3](https://github.com/redimp/otterwiki/commit/bc38ec3)).
+- Set `<title>` for blame, about, syntax, help, draft, 404, and edit pages, see #485 ([e15dbef](https://github.com/redimp/otterwiki/commit/e15dbef), [dc7dc4a](https://github.com/redimp/otterwiki/commit/dc7dc4a) by @civviGH).
+- Render repeated footnote references with same number ([4179fe1](https://github.com/redimp/otterwiki/commit/4179fe1)).
+- Log mermaid parse errors to the browser console ([f81c4a4](https://github.com/redimp/otterwiki/commit/f81c4a4)).
+- Serve SVG attachments without PIL thumbnailing ([2c4a4b1](https://github.com/redimp/otterwiki/commit/2c4a4b1)).
+- Forward to original page after login from all permission gates, see #483 ([3734d93](https://github.com/redimp/otterwiki/commit/3734d93) by @Harriotskelli, [01327dd](https://github.com/redimp/otterwiki/commit/01327dd), [faa85d5](https://github.com/redimp/otterwiki/commit/faa85d5)).
+
+### Dependencies
+
+- Bump gitpython from 3.1.47 to 3.1.50, see #482 ([f9b72f4](https://github.com/redimp/otterwiki/commit/f9b72f4), [d3418e4](https://github.com/redimp/otterwiki/commit/d3418e4) by @dependabot).
+- Bump mistune from 3.2.0 to 3.2.1, see #479 ([8db1217](https://github.com/redimp/otterwiki/commit/8db1217) by @dependabot).
+
+## [v2.20.4](https://github.com/redimp/otterwiki/releases/tag/v2.20.4) - 2026-05-01
+
+<small>[Compare with v2.20.3](https://github.com/redimp/otterwiki/compare/v2.20.3...v2.20.4)</small>
+
+### Bug Fixes
+
+- Fix improper text wrapping in sidebar ([e2fa225](https://github.com/redimp/otterwiki/commit/e2fa225) by @jr-krandino).
+- Keep sidebar tree indicator inline with long pagenames ([125cb86](https://github.com/redimp/otterwiki/commit/125cb86)).
+- Load MathJax for plain `$...$` and `$$...$$` math, see #474 ([76898f6](https://github.com/redimp/otterwiki/commit/76898f6)).
+- `titleSs()` handles apostrophes correctly, see #453 ([257fbc9](https://github.com/redimp/otterwiki/commit/257fbc9)).
+
+## [v2.20.3](https://github.com/redimp/otterwiki/releases/tag/v2.20.3) - 2026-04-26
+
+<small>[Compare with v2.20.2](https://github.com/redimp/otterwiki/compare/v2.20.2...v2.20.3)</small>
+
+### Features
+
+- Add `/.well-known/change-password` redirect to settings, implementing the W3C well-known change password URL spec ([591ea25](https://github.com/redimp/otterwiki/commit/591ea25) by @onovy).
+
+### Bug Fixes
+
+- Render fold and spoiler blocks correctly after lists, related to #450 ([be08160](https://github.com/redimp/otterwiki/commit/be08160)).
+- Make spoiler example functional in help/syntax page, see #463 ([87e1282](https://github.com/redimp/otterwiki/commit/87e1282)).
+- Preserve indentation in commit diff view ([e8dbab9](https://github.com/redimp/otterwiki/commit/e8dbab9) by @onovy).
+
+### Dependencies
+
+- Bump gitpython from 3.1.44 to 3.1.47 ([fbb5cf2](https://github.com/redimp/otterwiki/commit/fbb5cf2) by @dependabot).
+- Bump pillow from 12.1.1 to 12.2.0 ([3869aa6](https://github.com/redimp/otterwiki/commit/3869aa6) by @dependabot).
+- Upgrade mermaid 11.12.3 to 11.14.0 ([57b72f9](https://github.com/redimp/otterwiki/commit/57b72f9) by @fidergo-stephane-gourichon).
+- Upgrade MathJax 3.2.0 to 4.1.1 ([34f8e18](https://github.com/redimp/otterwiki/commit/34f8e18) by @fidergo-stephane-gourichon).
+- Upgrade sortablejs 1.15.3 to 1.15.7 ([2b74c6c](https://github.com/redimp/otterwiki/commit/2b74c6c) by @fidergo-stephane-gourichon).
+- Upgrade htmx 2.0.6 to 2.0.8 ([49a4309](https://github.com/redimp/otterwiki/commit/49a4309) by @fidergo-stephane-gourichon).
+
+### Misc
+
+- Helm chart: use `Recreate` as deployment strategy ([ac4d351](https://github.com/redimp/otterwiki/commit/ac4d351)).
+
+## [v2.20.2](https://github.com/redimp/otterwiki/releases/tag/v2.20.2) - 2026-04-09
+
+<small>[Compare with v2.20.1](https://github.com/redimp/otterwiki/compare/v2.20.1...v2.20.2)</small>
+
+### Bug Fixes
+
+- Render alerts correctly after lists, see #450 ([6b02637](https://github.com/redimp/otterwiki/commit/6b02637)).
+- Redirect to `/` with toast when path sanitizes to empty pagename ([357deb8](https://github.com/redimp/otterwiki/commit/357deb8)).
+
+## [v2.20.1](https://github.com/redimp/otterwiki/releases/tag/v2.20.1) - 2026-04-04
+
+<small>[Compare with v2.20.0](https://github.com/redimp/otterwiki/compare/v2.20.0...v2.20.1)</small>
+
+### Features
+
+- New `{{Figure}}` embedding for wrapping content blocks ([7e72dc1](https://github.com/redimp/otterwiki/commit/7e72dc1)).
+- Added YouTube support to `{{Video}}` embedding ([b3bd208](https://github.com/redimp/otterwiki/commit/b3bd208a036280b17745a1a6dcdd8e2e84be9551), [89459a5](https://github.com/redimp/otterwiki/commit/89459a5c6e179318290e2830e8a2584621d3ac1b)).
+- Added `src=` option to `{{ImageFrame}}` for embedding image attachments ([f0dbe4c](https://github.com/redimp/otterwiki/commit/f0dbe4c952d212690c344d0dc86ee4148145d189)).
+- Support absolute `src=` paths in `{{DataTable}}` ([881c1f0](https://github.com/redimp/otterwiki/commit/881c1f093c486364d2ba0dcd37e68be928edc3b3)).
+
+### Bug Fixes
+
+- Fix inline markdown rendering in embeddings help ([c89ac59](https://github.com/redimp/otterwiki/commit/c89ac5969f5f82476527280779e070e868518d44)).
+- Anchor fold/spoiler blocks to line start ([a015195](https://github.com/redimp/otterwiki/commit/a015195602de26b1db941472b6ae83cffb50db81)).
+- Support parenthesis-delimited titles in link reference definitions ([1facd98](https://github.com/redimp/otterwiki/commit/1facd98af78bda78f3a48aa4703bb47a1d8c3c78)).
+
+### Refactoring
+
+- Move `{{InfoBox}}` and `{{ImageFrame}}` inline styles to `static_css()` classes ([5f71637](https://github.com/redimp/otterwiki/commit/5f71637d9d7a3414e49fc1369dbd6523cbe4f8cf))
+  and ([22ceb2e](https://github.com/redimp/otterwiki/commit/22ceb2e3ee3ab0b1b66efb1ed14f914dbbd9e562)).
+
+## [v2.20.0](https://github.com/redimp/otterwiki/releases/tag/v2.20.0) - 2026-04-01
+
+<small>[Compare with v2.19.0](https://github.com/redimp/otterwiki/compare/v2.19.0...v2.20.0)</small>
+
+### Security Fixes
+
+- Add CSRF protection via `SameSite=Lax` cookies and `Flask-WTF` tokens ([5bea252](https://github.com/redimp/otterwiki/commit/5bea25261d726415b45c54f0fa48dbb73378ad98) by @onovy).
+  This is controlled by `WTF_CSRF_ENABLED` which defaults to `True` and
+  `WTF_CSRF_TIME_LIMIT` which defaults to `86400`.
+- Make password reset tokens single-use, disable remember-me on reset ([75152f6](https://github.com/redimp/otterwiki/commit/75152f6ca4292b9c4209fefb24b5f7b7053545a5) by @onovy).
+- Escape mermaid code block content to prevent XSS ([1747d89](https://github.com/redimp/otterwiki/commit/1747d89013105773c8ac23db5d032a65049e55b4) by @onovy).
+- Add security response headers ([3682750](https://github.com/redimp/otterwiki/commit/3682750feff8d22dfbc76ecb04f4c04f1c7a3ec7) by @onovy).
+- Remove ambiguous `|safe` from commit message rendering in templates ([c60420f](https://github.com/redimp/otterwiki/commit/c60420f6862f2d89093d6aba484620faf9e43f15) by @onovy).
+- Prevent account enumeration via generic recovery messages ([7ded053](https://github.com/redimp/otterwiki/commit/7ded05380a3abde3118196f21e9c890d446d0403) by @onovy).
+
+### Features
+
+- Add configuration options for CSRF protection ([73e5516](https://github.com/redimp/otterwiki/commit/73e5516cec93a43c52da358dea2892adab968653)).
+- Make security response headers configurable ([62cebe6](https://github.com/redimp/otterwiki/commit/62cebe63724d121132005315e88a9fdf21acd885)).
+
+### Bug Fixes
+
+- Store `HOME_PAGE` in preferences on update, see #439 ([ccd1a54](https://github.com/redimp/otterwiki/commit/ccd1a54266fa13423f14738e4919ad9c2573c0a6)).
+- Fix font-size for `<pre>` and `<code>` elements ([c0086dd](https://github.com/redimp/otterwiki/commit/c0086dd6a1b67b5c2ff23e91dfdc328601b03ed4)).
+- Ensure empty `SERVER_NAME` is set to None ([2e2c793](https://github.com/redimp/otterwiki/commit/2e2c79324ed3aa10bf836c83353b259c14e1b890)).
+
+### Dependencies
+
+- Bump pygments from 2.18.0 to 2.20.0 ([f744ed8](https://github.com/redimp/otterwiki/commit/f744ed82a68a7e6751abb492b96287f315199bf7) by @onovy).
+- Bump pygments from 2.19.2 to 2.20.0 ([4ac8e38](https://github.com/redimp/otterwiki/commit/4ac8e382d3827529d637fe7dd5242b23a5a37d4a) by @dependabot).
+
+## [v2.19.0](https://github.com/redimp/otterwiki/releases/tag/v2.19.0) - 2026-03-28
+
+<small>[Compare with v2.18.2](https://github.com/redimp/otterwiki/compare/v2.18.2...v2.19.0)</small>
+
+### Security Fixes
+
+- Prevent XSS via flash message toast ([f0f4da9](https://github.com/redimp/otterwiki/commit/f0f4da92f98f37c35ce37c13214f267d80af1d04) by @onovy).
+- Prevent ReDoS via user-supplied regex with timeout in search ([0c84d58](https://github.com/redimp/otterwiki/commit/0c84d582d065922d6b9d9ea30307eecf5c78880f) by @onovy).
+
+### Bug Fixes
+
+- Handle non-UTF-8 files gracefully instead of crashing ([f81a173](https://github.com/redimp/otterwiki/commit/f81a1732cd6fa3fe862be5c42e1c60902de34d29)).
+- Correct math block parsing in code spans, lists and inline contexts ([0ef7138](https://github.com/redimp/otterwiki/commit/0ef7138374e25ad015eeba4705ca7b753f1f49e8)).
+- Inline math blocks must be more than `$` or `$$` ([593aba4](https://github.com/redimp/otterwiki/commit/593aba41fb5608f41d59ce34c1cf2362ad0a9227)).
+- Fix multi-paragraph fancy blocks by replacing `$` with `\Z` in scanner pattern ([3a49e3c](https://github.com/redimp/otterwiki/commit/3a49e3cacc6a4a02f7a8f70f449bbfe83d3eac70) by @onovy).
+- Swap footnote ref id/href so multi-reference footnotes produce valid anchors ([04feafa](https://github.com/redimp/otterwiki/commit/04feafa72fa4ae3d417f70b926802cd03c3be78d) by @onovy).
+- Correct `[A-z]` regex typo to `[A-Za-z]` in embedding name pattern ([2422d91](https://github.com/redimp/otterwiki/commit/2422d91eb912e0e31bb243ee629ef3484162a8f0) by @onovy).
+- Fix `_findTable` function name ([4ea9bff](https://github.com/redimp/otterwiki/commit/4ea9bff9109767cfcd0ea1054ddf5c4bb589da8c) by @onovy).
+- Remove dead code in mermaid `block_code` branch ([581310c](https://github.com/redimp/otterwiki/commit/581310c5d82bb865f97b7c995591c5458c3f6efc) by @onovy).
+
+### Dependencies
+
+- Upgrade mistune from 2.0.5 to 3.2.0 ([abf3d61](https://github.com/redimp/otterwiki/commit/abf3d615690d8016f684607f6bf49d88e0691e0b) by @onovy).
+
+### Misc
+
+- Helm chart: fix `storageClassName`, update version ([04d308f](https://github.com/redimp/otterwiki/commit/04d308ff7d31700e20baea657d43a784f88dc548)).
+- Clean up template newlines ([392e58c](https://github.com/redimp/otterwiki/commit/392e58cc77319210633d4cf9a73c4d2309a4e07c)).
+
+## [v2.18.2](https://github.com/redimp/otterwiki/releases/tag/v2.18.2) - 2026-03-22
+
+<small>[Compare with v2.18.1](https://github.com/redimp/otterwiki/compare/v2.18.1...v2.18.2)</small>
+
+### Features
+
+- New `{{PageIndex}}` embedding that renders the page index of subpages ([ed6d1df](https://github.com/redimp/otterwiki/commit/ed6d1df8aa053eaf6a5f733ed6244c101a8cc89b)).
+- New `sidebarPageIndex` plugin hook for sidebar page index filter and sort ([f98af59](https://github.com/redimp/otterwiki/commit/f98af593cd36f57cf70676812fe60b34203a30f7) by @Rengyr).
+
+### Bug Fixes
+
+- `clean_html` fix, additional permission checks, fixed login redirects ([4c92ebc](https://github.com/redimp/otterwiki/commit/4c92ebcd21dae6a9f0682925442ac51b7ad2099c) by @deseven).
+- Typos in help, allow more tags and attributes in `clean_html` ([a942327](https://github.com/redimp/otterwiki/commit/a94232776ea306111ff0cd8cfc3a3ed903005815)).
+- Prepend preview cursor if found in a fancy block, see #377 ([2b8c44c](https://github.com/redimp/otterwiki/commit/2b8c44cc0dd1f239820765ee2a274a2472bf1826)).
+- Embedding key value parsing, see #413 ([4edba9c](https://github.com/redimp/otterwiki/commit/4edba9c97876c88b0ca1c1d298fdfb308718e7b6)).
+
+### Documentation
+
+- Added documentation for general use of embeddings ([3dc9cfa](https://github.com/redimp/otterwiki/commit/3dc9cfa6fd9bd4fb92f9400db96c9451d2671817)).
+- Add example for sidebar page index plugin ([65c60e2](https://github.com/redimp/otterwiki/commit/65c60e221e67b8fb8f7fd737cb51e3a43f74c30b) by @Rengyr).
+- Added note that the hooks has to modify `sidebarPageIndexEntries` in-place ([1cf1a45](https://github.com/redimp/otterwiki/commit/1cf1a45b277dc1dbafd0b79852c1d52859801e8c)).
+
+## [v2.18.1](https://github.com/redimp/otterwiki/releases/tag/v2.18.1) - 2026-03-17
+
+<small>[Compare with v2.18.0](https://github.com/redimp/otterwiki/compare/v2.18.0...v2.18.1)</small>
+
+**Security Update**
+
+This release addresses a critical security vulnerability. We strongly recommend
+updating to this version as soon as possible. The vulnerability allowed users
+who were logged in but did not have administrator privileges to modify application
+preferences, potentially leading to unauthorized changes and unauthorized access.
+
+### Security Fix
+
+- added missing guards (and tests) in preferences ([#415](https://github.com/redimp/otterwiki/pull/415) by Schuyler Erle/@schuyler and [711f344](https://github.com/redimp/otterwiki/commit/711f344ac7b4a279bdac97b80f2098d5ab62fb1f) by @redimp).
+
+### Bug Fixes
+
+- support Unicode and escaped equals in option keys ([af52da9](https://github.com/redimp/otterwiki/commit/af52da96679641003ce3083b759d2029d09dfaea) by Ralph Thesen).
+- add docker labels to production stage and not compile-stage ([bacc848](https://github.com/redimp/otterwiki/commit/bacc8483ce68f6fd1cb289a56c4620f1eb587967) by Maksymilian Wrzesień/@m-wrzesien).
+- typo in AttachmentList documentation ([dad590e](https://github.com/redimp/otterwiki/commit/dad590e5e44c05a83809ce1c4abe872244ad99fe) by Ralph Thesen).
+
+## [v2.18.0](https://github.com/redimp/otterwiki/releases/tag/v2.18.0) - 2026-03-14
+
+<small>[Compare with v2.17.3](https://github.com/redimp/otterwiki/compare/v2.17.3...v2.18.0)</small>
+
+### Features
+
+- **Experimental!** New embedding system: `{{embedding ...}}` blocks in pages ([d1cf80d](https://github.com/redimp/otterwiki/commit/d1cf80d9e915fb6ef845830c167e7456ad18ebc8)),
+  with built-in embeddings:
+  - `{{InfoBox}}` display structured information next to the main content, see #334
+  - `{{ImageFrame}}` display a image in a framed box next to the main content, see #178
+  - `{{DataTable}}` turn any markdown table in a page-, sort- and searchable data table, see #391.
+    - `{{DataTable|src=...}}` supports importing CSV attachments as datatable ([c2415db](https://github.com/redimp/otterwiki/commit/c2415db96ac9880a7dc7d119d823e19eed0d42de)).
+  - `{{Video}}` embed a video from an url or an attachment into a wiki page
+  - `{{AttachmentList}}` display the attachments to the page in various styles, this was discussed in #391.
+- New Flask CLI for user management, including password removal/generation, see #401 #402 ([9112672](https://github.com/redimp/otterwiki/commit/91126722a0462cbaf68eb343e8e4cdba8c01639a) by @deseven).
+- New `ADMIN_USER_EMAIL` setting for controlled admin registration, see #353 ([0178ab6](https://github.com/redimp/otterwiki/commit/0178ab6f30762faa41955eb854d347e03c106c22)).
+- New `DEFAULT_COMMIT_MESSAGE` setting, see #379 ([c979385](https://github.com/redimp/otterwiki/commit/c979385cb3d29ee396acd653a34f7ecf3940453f)).
+- Inline attachment improvements, see #407 ([e951fed](https://github.com/redimp/otterwiki/commit/e951fed28bf35323b249b6cf097322c5f242d63e) by @deseven).
+- Added `SERVER_NAME` to Application Preferences, ([75977a2](https://github.com/redimp/otterwiki/commit/75977a269e048897f71ccee7393ebb48a89f39e5)).
+  Thanks to @LeaveerWang and @BrookeYangRui for reaching out and bringing potential security
+  risks when running the app without `SERVER_NAME` and not behind a reverse proxy to our
+  attention, see [otterwiki.com](https://otterwiki.com/-/commit/7eb36f).
+- `clean_html` rewrite with custom allow list support ([35b9bcd](https://github.com/redimp/otterwiki/commit/35b9bcd1abe18b41e00307bece883cf8ab6f0e5e) by @deseven).
+- Added more icons for additional attachment mime-types ([5aa6eb1](https://github.com/redimp/otterwiki/commit/5aa6eb1ffdd4fb7f61bb85e9d1a787852afb7386)).
+- Updates in the plugin system:
+  - page life cycle hooks `page_saved`, `page_deleted`, `page_renamed` ([5c6a833](https://github.com/redimp/otterwiki/commit/5c6a833a34de5d4d09ed603fc163f73e99c676cc) by Schuyler Erle/@schuyler).
+  - `page_render_context` hook ([686859c](https://github.com/redimp/otterwiki/commit/686859c8be24d420feedc13c3682b5b38af699d5))
+  - `static_css` hook for adding css used by a plugin ([1d16d94](https://github.com/redimp/otterwiki/commit/1d16d94ff0a2b70e1ea6b8bf4a75e583be4f1130) by @redimp).
+  - `renderer_javascript` hook for plugins to inject JavaScript into rendered pages ([1d16d94](https://github.com/redimp/otterwiki/commit/1d16d94ff0a2b70e1ea6b8bf4a75e583be4f1130)).
+  - `embedding_parse` and `embedding_render` hooks for custom `{{embedding ...}}` blocks ([d1aa50e](https://github.com/redimp/otterwiki/commit/d1aa50ea09aacb6f6c67fc510d7ec28909c1382c)).
+  - `info` and `help` hooks for plugin self-documentation and grouping by category.
+  - `url_request` and `url_admin_request` hooks for handling requests to `/-/plugin/<name>/` and `/-/admin/plugin/<name>/`.
+
+### Bug Fixes
+
+- Added a light mode sidebar CSS rule ([da31071](https://github.com/redimp/otterwiki/commit/da310711f8eef439bd5cdb63607beb8727ef1fc8) by @ryanwhowe).
+- Vertical jumps in sidebar when changing pages ([d4b558e](https://github.com/redimp/otterwiki/commit/d4b558e5511a54d51741ea7c2c6a69e69ba1599f) by @tvanas) with additional input from @ryanwhowe in #410.
+- Replace preview watermark with a lighter version ([cfee9d3](https://github.com/redimp/otterwiki/commit/cfee9d3b62db68b115e13f6136570eb6e5402a3e) by Gabriele Bartoli/@Prodeguerriero).
+- Editor table reformat not affecting other blocks ([bcfe326](https://github.com/redimp/otterwiki/commit/bcfe326fec022330b09c200ec5aa5bb7e839a25d)).
+- Don't escape text in links, markdown in link text is allowed ([70a5911](https://github.com/redimp/otterwiki/commit/70a59118028186c4ae9580324efcd1326824f0dc)).
+- Prevent zoom into forms on iOS ([169669f](https://github.com/redimp/otterwiki/pull/398/changes/169669ff2bac9ae58959c6b0125e8bbb762b5f43) by @gokomer)
+
+### Dependencies
+
+- Updated mermaid to 11.12.3 ([fbd44f9](https://github.com/redimp/otterwiki/commit/fbd44f91aea3b1d51005a8b3f6fb2d1594a5c3f7)).
+- Added simple-datatables for DataTable embedding ([1b950a5](https://github.com/redimp/otterwiki/commit/1b950a56cf8eaa72095410340822457d5ae21279)).
+
+## [v2.17.3](https://github.com/redimp/otterwiki/releases/tag/v2.17.3) - 2026-02-22
+
+<small>[Compare with v2.17.2](https://github.com/redimp/otterwiki/compare/v2.17.2...v2.17.3)</small>
+
+### Features
+
+- Docker images now got the labels added required for `renovate` to deploy the changelog, see #387 ([73a24a2](https://github.com/redimp/otterwiki/commit/73a24a2b79edae35298a00fa5de80bf19e34eb0d) by @m-wrzesien).
+- Housekeeping now provides a checker for broken WikiLinks, see #388 ([35576bd](https://github.com/redimp/otterwiki/commit/35576bd38124d78c48ff3f0fc30384120d94d800) by @deseven).
+- current page is highlighted in the sidebar, see #393 ([9c8b35a](https://github.com/redimp/otterwiki/pull/393/changes/9c8b35ac7a41503400b3f5a538ffc5238049f919) by @ryanwhowe)
+- Plugin system got new hooks, fixed default values for hooks, see #386 by @deseven.
+
+### Bug Fixes
+
+- links and images rendered from markdown were not escaped, this bug was introduced in 2.16.0
+  ([1722ab9](https://github.com/redimp/otterwiki/commit/1722ab93ab2aa0d60026f05ce4cd0a6471677a30) by @redimp).
+
+## [v2.17.2](https://github.com/redimp/otterwiki/releases/tag/v2.17.2) - 2026-02-11
+
+<small>[Compare with v2.17.1](https://github.com/redimp/otterwiki/compare/v2.17.1...v2.17.2)</small>
+
+### Bug Fixes
+
+- Enable `/` hotkey for keyboard layouts needing shift to type '/', see #383 ([6ee5592](https://github.com/redimp/otterwiki/commit/6ee55922ca68f8c9d47e5d8fba31f57bad23a8b8) by @redimp).
+- preserve (and display) multiple spaces in codespans, see #382 ([0f669d8](https://github.com/redimp/otterwiki/commit/0f669d8f6033b74b4d0e6d60e73815a99ca4998d) by @redimp).
+- confusing editor behaviour on URL pasting, see #380 ([2f73bdf](https://github.com/redimp/otterwiki/commit/2f73bdfa45df4b18d72dac59c241f6332f90f499) by @deseven).
+
+### Plugins
+
+- `plugin_redlinks`: fixed page lowercase logic, see #376 ([0d4b80c](https://github.com/redimp/otterwiki/commit/0d4b80cf46a004307b53eb926fc65f7e12b36f89) by @freddyheppell)
+
+## [v2.17.1](https://github.com/redimp/otterwiki/releases/tag/v2.17.1) - 2026-02-02
+
+### Bug Fixes
+
+- fixed broken syntax page ([bc2da8b](https://github.com/redimp/otterwiki/commit/bc2da8bd03d4b03da04298f0982a201396f0ddbf) by @deseven)
+- redirect not logged in users to the login page where applicable ([8b9289d](https://github.com/redimp/otterwiki/commit/8b9289d8939b6f0ae206ec2e6ea76d58f9e23bf6) by @deseven)
+
+<small>[Compare with v2.17.0](https://github.com/redimp/otterwiki/compare/v2.17.0...v2.17.1)</small>
+
+## [v2.17.0](https://github.com/redimp/otterwiki/releases/tag/v2.17.0) - 2026-02-01
+
+<small>[Compare with v2.16.0](https://github.com/redimp/otterwiki/compare/v2.16.0...v2.17.0)</small>
+
+### Features
+
+- custom home page, see #354 ([16e1a94](https://github.com/redimp/otterwiki/commit/16e1a94212e1cf0981d20e898c242ce0e598afbc) by @deseven).
+- Editor: Add Wikilinks with Title, see #357 and #358 ([466c338](https://github.com/redimp/otterwiki/pull/358/changes/466c338fc2827a55253d7bd24c286cda917c4c45) by @ryanwhowe)
+- plugin hook for Wikilinks rendering and example plugin, see #363 ([6d20a5a](https://github.com/redimp/otterwiki/commit/6d20a5adede14ddfd9d445139b9e65d6e1fc3d5a) by @deseven).
+- added hotkey `]` to toggle the right extra sidebar, see #366 ([4ec484e](https://github.com/redimp/otterwiki/commit/4ec484e5542801676a782bdf9e3dcade622a0764)).
+- page blame: add the commit message for a better blame view, see #367 ([f51965e](https://github.com/redimp/otterwiki/commit/f51965e6d4ae8507bc1fcf9809a2c0ab8e3961a6)).
+
+### Bug Fixes
+
+- title-bar `SITE_NAME` title changed to `SITE_DESCRIPTION`, see #356 ([85a110d](https://github.com/redimp/otterwiki/commit/85a110dd0362fbf1b96aa466e2fc90679fd5dbe4)).
+- icon alignments in sidebar, see #362 ([db70758](https://github.com/redimp/otterwiki/pull/362/changes/db707580274bddbf224612bbee5a098f9831f810) by @tvanas)
+- lowercase GitHub-style alerts, see #360 ([1c6876d](https://github.com/redimp/otterwiki/pull/360/changes/1c6876dafb7718180d5ef3cf33da76ccfd7fcda2) by @aimileus)
+
+## [v2.16.0](https://github.com/redimp/otterwiki/releases/tag/v2.16.0) - 2026-01-18
+
+<small>[Compare with v2.15.2](https://github.com/redimp/otterwiki/compare/v2.15.2...v2.16.0)</small>
+
+### Features
+
+- Syncing with remote repositories, see `Settings > Repository Management`.
+  - automatic pulling from from the defined git remote ([111c5c1](https://github.com/redimp/otterwiki/commit/111c5c1043c12b7dfd11de31954583e3cf8193a6) by @deseven).
+  - automatic pushing to the defined git remote ([8d10cc6](https://github.com/redimp/otterwiki/commit/8d10cc6d299c6d64a71f31d64a9b0acba54aefe9) by @deseven).
+  - repository management manual actions ([6c89261](https://github.com/redimp/otterwiki/commit/6c892612ac8442bf4231ec213afcacd26fc9563a) by @deseven).
+- More options to customize the wiki using custom css
+  - added classes with levels to the pageindex items ([91d797e](https://github.com/redimp/otterwiki/commit/91d797eebc5f25621f138f323608eddd8d82fb5b)).
+  - support custom fancy block styles, see #345 and #343 ([fde2bf6](https://github.com/redimp/otterwiki/pull/345/commits/fde2bf68bf05011d35a9fa4e4967db79ca636f30) by @freddyheppell).
+  - make pages customizable via css based on their pathname ([PR#349](https://github.com/redimp/otterwiki/pull/349) by @freddyheppell).
+- Improving the plugin environment
+  - added more plugin hooks for html injection & processing ([7f0fcbc](https://github.com/redimp/otterwiki/pull/336/commits/7f0fcbc7feb2260f4800df382309804d1f5120ff) by @deseven).
+
+### Bug Fixes
+
+- better preview cursor placement, see #330 ([0797796](https://github.com/redimp/otterwiki/commit/079779671934e53c294875c2f4ac45d257f3f457)).
+- scrollbar styling for `width<=768px`, see #332 ([562edac](https://github.com/redimp/otterwiki/commit/562edac8d25d7baadea5c001f155765588a73ea7)).
+- `sanitize_pagename(.., handle_md=True)` regexp fixed, see #344 ([bed5cc5](https://github.com/redimp/otterwiki/commit/bed5cc551920cf8eef14dc82c10704eb5cc80863)).
+
+## [v2.15.2](https://github.com/redimp/otterwiki/releases/tag/v2.15.2) - 2026-01-07
+
+<small>[Compare with v2.15.1](https://github.com/redimp/otterwiki/compare/v2.15.1...v2.15.2)</small>
+
+### Bug Fixes
+
+- edit/preview switching while resizing the window works ([508b8fa](https://github.com/redimp/otterwiki/commit/508b8fa6150e650b7769dc2055098fb3ffa40f31)).
+- slim-image: Configure uWSGI with environment variables ([3e3f6f2](https://github.com/redimp/otterwiki/commit/3e3f6f274a7b5424f7df3745e9d4364561b920af)).
+
+## [v2.15.1](https://github.com/redimp/otterwiki/releases/tag/v2.15.1) - 2026-01-02
+
+<small>[Compare with v2.15.0](https://github.com/redimp/otterwiki/compare/v2.15.0...v2.15.1)</small>
+
+### Bug Fixes
+
+- `load_custom_html` respects `USE_STATIC_PATH`, see #329 ([9da7cb4](https://github.com/redimp/otterwiki/pull/331/commits/9da7cb459c40a341ef86d9a82bac5b0120b0e21d))
+
+## [v2.15.0](https://github.com/redimp/otterwiki/releases/tag/v2.15.0) - 2025-12-18
+
+<small>[Compare with v2.14.4](https://github.com/redimp/otterwiki/compare/v2.14.4...v2.15.0)</small>
+
+### Features
+
+- Better Customization: custom head and body html from files ([e7b4aef](https://github.com/redimp/otterwiki/commit/e7b4aef0336befafba6975b0ba334ca953c6c53b) by deseven).
+- The sidebar menu can now display icons and separators  ([128af8f](https://github.com/redimp/otterwiki/commit/128af8fcb2babd9e934cfc31c0cb58ca759c9b7c) by deseven).
+- Improved head and meta data: canonical urls, meta description ([0754fe2](https://github.com/redimp/otterwiki/commit/0754fe2246d660834d166c87b66a0d4221fc80f7) by deseven).
+- Improved Page loading: load mermaid and mathjax only when needed ([fa93a42](https://github.com/redimp/otterwiki/commit/fa93a421e3a0ae38cb91a88287a8491a892eae26) by deseven).
+
+### Bug Fixes
+
+- Renamed pages can now handle history and revisions, no more broken links after page rename ([1a8d890](https://github.com/redimp/otterwiki/commit/1a8d890f94e6226d5395e854f5afc3b7de988eb2) by deseven).
+
 ## [v2.14.4](https://github.com/redimp/otterwiki/releases/tag/v2.14.4) - 2025-12-06
 
 <small>[Compare with v2.14.3](https://github.com/redimp/otterwiki/compare/v2.14.3...v2.14.4)</small>

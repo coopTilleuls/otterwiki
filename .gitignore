@@ -28,3 +28,4 @@ docker/entrypoint-lt.sh
 docker/nginx.conf
 docker/wiki.cert
 docker/wiki.key
+node_modules/

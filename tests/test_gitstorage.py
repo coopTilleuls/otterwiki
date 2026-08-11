@@ -449,3 +449,147 @@ def test_get_parent_revision(storage):
         filename=filename1, revision=revision3
     )
     assert parent_revision == revision1
+
+
+# a revision that git would parse as a CLI option (leading '-') or is
+# otherwise not a hex commit-ish must be rejected before reaching git.
+INVALID_REVISIONS = [
+    "--output=Home.md",
+    "--contents=.env",
+    "-L1,1",
+    "--reverse",
+    "-p",
+    "--",
+    "HEAD~1",
+    "main",
+    "not-hex-zz",
+    "",
+]
+
+
+@pytest.fixture
+def storage_with_page(storage):
+    author = ("Example Author", "mail@example.com")
+    storage.store(
+        "Home.md",
+        content="# Home\nline2\nline3\n",
+        author=author,
+        message="initial",
+    )
+    yield storage
+
+
+@pytest.mark.parametrize("revision", INVALID_REVISIONS)
+def test_load_rejects_invalid_revision(storage_with_page, revision):
+    with pytest.raises(gitstorage.StorageError):
+        storage_with_page.load("Home.md", revision=revision)
+
+
+@pytest.mark.parametrize("revision", INVALID_REVISIONS)
+def test_blame_rejects_invalid_revision(storage_with_page, revision):
+    with pytest.raises(gitstorage.StorageError):
+        storage_with_page.blame("Home.md", revision=revision)
+
+
+@pytest.mark.parametrize("revision", INVALID_REVISIONS)
+def test_diff_rejects_invalid_revision(storage_with_page, revision):
+    good = storage_with_page.log()[0]["revision"]
+    # rejected whether the tainted value is the first or the second argument
+    with pytest.raises(gitstorage.StorageError):
+        storage_with_page.diff(revision, good)
+    with pytest.raises(gitstorage.StorageError):
+        storage_with_page.diff(good, revision)
+
+
+@pytest.mark.parametrize("revision", INVALID_REVISIONS)
+def test_revert_rejects_invalid_revision(storage_with_page, revision):
+    with pytest.raises(gitstorage.StorageError):
+        storage_with_page.revert(revision)
+
+
+@pytest.mark.parametrize("revision", INVALID_REVISIONS)
+def test_show_commit_rejects_invalid_revision(storage_with_page, revision):
+    with pytest.raises(gitstorage.StorageError):
+        storage_with_page.show_commit(revision)
+
+
+def test_diff_output_injection_does_not_write_file(storage_with_page):
+    # the diff-route argument injection: '--output=<page>' must not
+    # truncate/overwrite the page instead of producing a diff.
+    good = storage_with_page.log()[0]["revision"]
+    before = storage_with_page.load("Home.md")
+    with pytest.raises(gitstorage.StorageError):
+        storage_with_page.diff("--output=Home.md", good)
+    assert storage_with_page.load("Home.md") == before
+
+
+def test_valid_revisions_still_accepted(storage_with_page):
+    author = ("Example Author", "mail@example.com")
+    storage_with_page.store(
+        "Home.md",
+        content="# Home\nline2\nline3\nline4\n",
+        author=author,
+        message="second",
+    )
+    log = storage_with_page.log()
+    rev_b, rev_a = log[0]["revision"], log[1]["revision"]
+    # short hex prefix (git strips the trailing newline)
+    older = storage_with_page.load("Home.md", revision=rev_a)
+    assert "line3" in older and "line4" not in older
+    assert storage_with_page.blame("Home.md", revision=rev_a)
+    assert "line4" in storage_with_page.diff(rev_a, rev_b)
+    # full hex sha
+    full = storage_with_page.metadata("Home.md")["revision-full"]
+    assert storage_with_page.blame("Home.md", revision=full)
+    # the literal HEAD (blame default)
+    assert storage_with_page.blame("Home.md", revision="HEAD")
+    # uppercase hex prefix
+    assert storage_with_page.blame("Home.md", revision=rev_a.upper())
+
+
+def test_restore_is_scoped_to_the_given_paths(storage):
+    """restore() must undo staged and working-tree changes below the given
+    paths only, leaving the rest of the repository alone."""
+    author = ("Example Author", "mail@example.com")
+    storage.store("target.md", content="target\n", author=author)
+    storage.store("bystander.md", content="bystander\n", author=author)
+    # stage a rename and an edit of the target ...
+    storage.rename("target.md", "renamed.md", author=author, no_commit=True)
+    # ... plus an unrelated, uncommitted change
+    storage.update(filename="bystander.md", content="bystander changed\n")
+
+    storage.restore(["target.md", "renamed.md"])
+
+    # the rename is undone ...
+    assert storage.exists("target.md")
+    assert not storage.exists("renamed.md")
+    assert storage.load("target.md") == "target\n"
+    # ... the unrelated change is untouched
+    assert storage.load("bystander.md") == "bystander changed\n"
+    assert "bystander.md" in storage.repo.git.diff("--cached", "--name-only")
+
+
+def test_restore_ignores_paths_unknown_to_git(storage):
+    """A rollback can run before anything was staged, so restore() must
+    tolerate paths git has never heard of instead of raising."""
+    author = ("Example Author", "mail@example.com")
+    storage.store("kept.md", content="kept\n", author=author)
+
+    # neither path is in the index or in HEAD
+    storage.restore(["never_existed.md", "no/such/dir"])
+    storage.restore([])
+
+    assert storage.load("kept.md") == "kept\n"
+
+
+def test_restore_handles_non_ascii_paths(storage):
+    """Paths are passed to git with -z, so page names git would otherwise
+    quote (core.quotePath) are still matched."""
+    author = ("Example Author", "mail@example.com")
+    filename = "Übung Sätze.md"
+    storage.store(filename, content="original\n", author=author)
+    storage.update(filename=filename, content="changed\n")
+
+    storage.restore([filename])
+
+    assert storage.load(filename) == "original\n"

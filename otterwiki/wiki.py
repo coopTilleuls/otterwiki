@@ -2,9 +2,11 @@
 # vim: set et ts=8 sts=4 sw=4 ai:
 
 import os
-import re
+import regex
 from datetime import UTC, datetime, timedelta
+
 from io import BytesIO
+from time import strftime
 from timeit import default_timer as timer
 from typing import List, cast
 from urllib.parse import unquote
@@ -17,6 +19,7 @@ from flask import (
     make_response,
     redirect,
     render_template,
+    request,
     send_file,
     url_for,
 )
@@ -44,7 +47,13 @@ from otterwiki.helper import (
     upsert_pagecrumbs,
 )
 from otterwiki.models import Drafts
-from otterwiki.plugins import chain_hooks
+from otterwiki.plugins import (
+    chain_hooks,
+    collect_hook,
+    call_hook,
+    plugin_manager,
+)
+from otterwiki.pluginmgmt import collect_plugin_info
 from otterwiki.renderer import pygments_render
 from otterwiki.server import app, app_renderer, db, storage
 from otterwiki.sidebar import SidebarMenu, SidebarPageIndex
@@ -63,6 +72,11 @@ from otterwiki.util import (
     get_PatchSet,
     int_or_None,
 )
+
+from .backlinks import rename_backlinks
+
+# global timeout used in regexps
+_REGEX_TIMEOUT = 5
 
 if not hasattr(PIL.Image, 'Resampling'):  # Pillow<9.0
     PIL.Image.Resampling = PIL.Image
@@ -96,6 +110,8 @@ class Changelog:
 
     def render(self):
         if not has_permission("READ"):
+            if not current_user.is_authenticated:
+                return redirect(url_for("login", next=request.full_path))
             abort(403)
         log = self.get()
         pages = []
@@ -178,7 +194,7 @@ class Changelog:
             # use the shorter page list
             pages = pages_short
 
-        menutree = SidebarPageIndex(get_page_directoryname("/"))
+        menutree = SidebarPageIndex("/")
         return render_template(
             "changelog.html",
             log=log,
@@ -219,6 +235,8 @@ class Changelog:
 
     def show_commit(self, revision):
         if not has_permission("READ"):
+            if not current_user.is_authenticated:
+                return redirect(url_for("login", next=request.full_path))
             abort(403)
         try:
             metadata, diff = storage.show_commit(revision)
@@ -234,7 +252,7 @@ class Changelog:
             filename = list(url_map.keys())[0]
             pagepath = get_pagepath(get_pagename(filename, full=True))
 
-        menutree = SidebarPageIndex(get_page_directoryname(pagepath or "/"))
+        menutree = SidebarPageIndex(pagepath)
 
         file_diffs = patchset2filedict(patchset)
         return render_template(
@@ -316,12 +334,16 @@ class Changelog:
         return fg
 
     def feed_rss(self):
+        if not has_permission("READ"):
+            abort(403)
         fg = self.get_feedgenerator()
         # update link
         fg.link(href=url_for("changelog_feed_rss", _external=True), rel='self')
         return fg.rss_str(pretty=True)
 
     def feed_atom(self):
+        if not has_permission("READ"):
+            abort(403)
         fg = self.get_feedgenerator()
         fg.id(url_for("changelog_feed_atom", _external=True))
         # update link
@@ -357,6 +379,7 @@ class Page:
         )
 
         # load page content and metadata
+        self.storage_error = None
         try:
             self.content, self.metadata = self.load(revision=self.revision)
             self.exists = True
@@ -364,6 +387,11 @@ class Page:
             self.metadata = None
             self.content = None
             self.exists = False
+        except StorageError as e:
+            self.metadata = None
+            self.content = None
+            self.exists = True
+            self.storage_error = str(e)
 
         if self.content is not None:
             header = get_header(self.content)
@@ -380,14 +408,39 @@ class Page:
     def load(self, revision: str | None):
         metadata = None
         content = None
-        try:
-            content = storage.load(self.filename, revision=revision)
-            metadata = storage.metadata(self.filename, revision=revision)
-        except StorageNotFound as e:
-            if all([not metadata, not content]):
-                # If both are None, raise the exception. Otherwise, a warning will show on the page that
-                # the file is not under version control.
-                raise e
+
+        # if a revision is specified, we need to handle potential previous file renames
+        if revision is not None:
+            try:
+                # first try with the current filename
+                content = storage.load(self.filename, revision=revision)
+                metadata = storage.metadata(self.filename, revision=revision)
+            except StorageNotFound as original_error:
+                # if that fails, try to get the filename that was used at this revision
+                try:
+                    filename_at_revision = storage.get_filename_at_revision(
+                        self.filename, revision
+                    )
+                    if filename_at_revision != self.filename:
+                        content = storage.load(
+                            filename_at_revision, revision=revision
+                        )
+                        metadata = storage.metadata(
+                            filename_at_revision, revision=revision
+                        )
+                    else:
+                        raise original_error
+                except StorageNotFound:
+                    raise original_error
+        else:
+            try:
+                content = storage.load(self.filename, revision=revision)
+                metadata = storage.metadata(self.filename, revision=revision)
+            except StorageNotFound as e:
+                if all([not metadata, not content]):
+                    # If both are None, raise the exception. Otherwise, a warning will show on the page that
+                    # the file is not under version control.
+                    raise e
 
         return content, metadata
 
@@ -397,6 +450,7 @@ class Page:
             response404 = make_response(
                 render_template(
                     "page404.html",
+                    title="{} - not found".format(self.pagename_full),
                     pagename=self.pagename_full,
                     pagepath=self.pagepath,
                 ),
@@ -408,8 +462,12 @@ class Page:
     def source(self, raw=False):
         # handle permissions
         if not has_permission("READ"):
+            if not current_user.is_authenticated:
+                return redirect(url_for("login", next=request.full_path))
             abort(403)
         # handle case that the page doesn't exists
+        if self.storage_error is not None:
+            abort(500, description=self.storage_error)
         self.exists_or_404()
 
         # set title
@@ -429,7 +487,7 @@ class Page:
             )
 
         source = pygments_render(self.content, lang='markdown')
-        menutree = SidebarPageIndex(get_page_directoryname(self.pagepath))
+        menutree = SidebarPageIndex(self.pagepath)
 
         return render_template(
             "source.html",
@@ -458,11 +516,38 @@ class Page:
                 toast(
                     "You lack the permissions to access this wiki. Please login."
                 )
-            return redirect(url_for(login_manager.login_view ))
+            return redirect(
+                url_for(login_manager.login_view, next=request.full_path)
+            )
         # handle case that page doesn't exists
         self.exists_or_404()
 
         upsert_pagecrumbs(get_pagename(self.pagepath, full=True))
+
+        if self.storage_error is not None:
+            menutree = SidebarPageIndex(self.pagepath)
+            return render_template(
+                "page.html",
+                title=self.pagename,
+                revision=self.revision,
+                pagename=self.pagename,
+                pagepath=self.pagepath,
+                htmlcontent="",
+                toc=[],
+                breadcrumbs=self.breadcrumbs(),
+                danger_alert=[
+                    "Storage error",
+                    self.storage_error,
+                ],
+                menutree=menutree.query(),
+                custom_menu=SidebarMenu().query(),
+                description="",
+                library_requirements=[],
+                canonical_url=url_for(
+                    "view", path=self.pagepath, _external=True
+                ),
+                extra_js="",
+            )
 
         danger_alert = False
         if not self.metadata:
@@ -471,8 +556,11 @@ class Page:
                 f"""This page was loaded from the repository but is not added under git version control. Make a commit on the <a href="/{self.pagepath}/edit" class="alert-link">Edit page</a> to add it.""",
             ]
 
+        # send context of the page rendered to plugins
+        call_hook("page_render_context", page=self, preview=False)
+
         # render markdown
-        htmlcontent, toc = app_renderer.markdown(
+        htmlcontent, toc, library_requirements = app_renderer.markdown(
             self.content, page_url=self.page_view_url
         )
         update_ftoc_cache(self.filename, ftoc=toc)
@@ -494,7 +582,7 @@ class Page:
         if self.revision is not None:
             title = "{} ({})".format(self.pagename, self.revision)
 
-        menutree = SidebarPageIndex(get_page_directoryname(self.pagepath))
+        menutree = SidebarPageIndex(self.pagepath)
 
         htmlcontent = chain_hooks(
             "page_view_htmlcontent_postprocess", htmlcontent, self
@@ -507,17 +595,50 @@ class Page:
         # strip the title if the description starts with it
         description = description.removeprefix(title)
         # replace new lines with middle dots
-        description = re.sub(r'[\n]+', '\n', description.strip())
+        description = regex.sub(r'[\n]+', '\n', description.strip())
         # add a seperator for better readability
         description = description.replace("\n", "·")
         # make sure the sperator does directly follow a punctuation mark
-        description = re.sub(r"([!.:,])\s*·", r"\1 ", description)
+        description = regex.sub(r"([!.:,])\s*·", r"\1 ", description)
         # finally shorten the description and use it as SITE_DESCRIPTION
         description = textwrap.shorten(
             description,
             width=254,
             placeholder="…",
         )
+
+        # generate canonical URL (without trailing slash)
+        # special case: if this is the configured home page, canonical should point to root "/"
+        home_page = app.config.get("HOME_PAGE", "")
+
+        is_home_page = False
+        if not home_page and self.pagepath.lower() == "home":
+            is_home_page = True
+        elif home_page and not home_page.startswith("/-/"):
+            # custom page - normalize both paths for comparison
+            custom_page_normalized = get_filename(
+                home_page.strip("/")
+            ).replace(".md", "")
+            current_page_normalized = self.filename.replace(".md", "")
+            if app.config.get("RETAIN_PAGE_NAME_CASE"):
+                is_home_page = (
+                    custom_page_normalized == current_page_normalized
+                )
+            else:
+                is_home_page = (
+                    custom_page_normalized.lower()
+                    == current_page_normalized.lower()
+                )
+
+        if is_home_page:
+            canonical_url = url_for("index", _external=True)
+        else:
+            canonical_url = url_for("view", path=self.pagepath, _external=True)
+
+        extra_js = "".join(collect_hook("renderer_javascript"))
+
+        if len(extra_js):
+            extra_js = f"<script type=\"text/javascript\">{extra_js}</script>"
 
         # render template
         return render_template(
@@ -533,17 +654,25 @@ class Page:
             menutree=menutree.query(),
             custom_menu=SidebarMenu().query(),
             description=description,
+            library_requirements=library_requirements,
+            canonical_url=canonical_url,
+            extra_js=extra_js,
         )
 
     def preview(self, content=None, cursor_line=None):
+        if not has_permission("WRITE"):
+            abort(403)
         if content is None:
             # handle case that the page doesn't exists
             self.exists_or_404()
             # no content in form use loaded page
             content = self.content
 
+        # send context of the page rendered to plugins
+        call_hook("page_render_context", page=self, preview=True)
+
         # render preview html from markdown
-        content_html, toc = app_renderer.markdown(
+        content_html, toc, library_requirements = app_renderer.markdown(
             content, cursor=cursor_line, page_url=self.page_view_url
         )
         # update pagename from toc
@@ -569,14 +698,20 @@ class Page:
             breadcrumbs=self.breadcrumbs(),
         )
 
+        preview_js = "".join(collect_hook("renderer_javascript"))
+
         return {
             "preview_content": preview_html,
             "preview_toc": toc_html,
+            "library_requirements": library_requirements,
+            "preview_js": preview_js,
         }
 
     def editor(self, author, handle_draft=None):
         if not has_permission("WRITE"):
             abort(403)
+        if self.storage_error is not None:
+            abort(500, description=self.storage_error)
         if self.exists:
             content = self.content
             # FIXME: This could be improved by storing the last position a user
@@ -604,6 +739,7 @@ class Page:
             if handle_draft is None:
                 return render_template(
                     "draft.html",
+                    title="{} - draft".format(self.pagename),
                     pagename=self.pagename,
                     pagepath=self.pagepath,
                     revision=(
@@ -641,12 +777,20 @@ class Page:
         )
         # get page listing
         page_idx = PageIndex()
+        # collect embedding_info to display in the markdown syntax help
+        embedding_info = collect_plugin_info(category="Syntax/Embeddings")
 
         return render_template(
             "editor.html",
+            title="{} - edit".format(self.pagename),
             pagename=self.pagename,
             pagepath=self.pagepath,
             content_editor=content,
+            default_commit_message=strftime(
+                app.config["DEFAULT_COMMIT_MESSAGE"].replace(
+                    "%P", self.pagename
+                )
+            ),
             files=files,
             pages=list(page_idx.pages()),
             cursor_line=cursor_line,
@@ -654,11 +798,20 @@ class Page:
             revision=(
                 self.metadata.get("revision", "") if self.metadata else ""
             ),
+            force_load_libraries=True,
+            embedding_info=embedding_info,
         )
 
     def save(self, content, commit, author):
         if not has_permission("WRITE"):
             abort(403)
+
+        if app.config["COMMIT_MESSAGE"].upper() == "DISABLED":
+            commit = strftime(
+                app.config["DEFAULT_COMMIT_MESSAGE"].replace(
+                    "%P", self.pagename
+                )
+            )
 
         # store page
         changed = storage.store(
@@ -671,6 +824,13 @@ class Page:
             toast("Nothing changed.", "warning")
         else:
             toast("{} saved.".format(self.pagename_full))
+            # notify plugins
+            plugin_manager.hook.page_saved(
+                pagepath=self.pagepath,
+                content=content,
+                author=author,
+                message=commit,
+            )
         # take care of drafts
         self.discard_draft(author)
         # redirect to view
@@ -687,11 +847,18 @@ class Page:
 
     def blame(self):
         if not has_permission("READ"):
+            if not current_user.is_authenticated:
+                return redirect(url_for("login", next=request.full_path))
             abort(403)
         # handle case that the page doesn't exists
+        if self.storage_error is not None:
+            abort(500, description=self.storage_error)
         self.exists_or_404(in_git=True)
 
-        data = storage.blame(self.filename, self.revision)
+        try:
+            data = storage.blame(self.filename, self.revision)
+        except StorageError:
+            abort(404)
 
         markup_lines = pygments_render(self.content, lang="markdown")
         # fix markup_lines
@@ -704,6 +871,7 @@ class Page:
         fdata = []
         # helper
         last = None
+        last_index = 0
         oddeven = "odd"
         # use highlighted lines
         for row in data:
@@ -715,7 +883,7 @@ class Page:
             if row[0] != last:
                 oddeven = "odd" if oddeven == "even" else "even"
                 fdata.append(
-                    (
+                    [
                         row[0],  # revision
                         row[1],  # author
                         row[2],  # datetime
@@ -723,35 +891,50 @@ class Page:
                         line,  # the actual line
                         f"chunk-start chunk-start-{oddeven}",  # alternating css class
                         row[0],  # revision used as border-color
-                    )
+                        row[5],  # commit message
+                        1,  # lines covered by the meta
+                    ]
                 )
                 last = row[0]
+                last_index = len(fdata) - 1
             else:
-                fdata.append(("", "", "", int(row[3]), line, oddeven, row[0]))
-        menutree = SidebarPageIndex(get_page_directoryname(self.pagepath))
+                fdata.append(
+                    ("", "", "", int(row[3]), line, oddeven, row[0], "", 0)
+                )
+                fdata[last_index][8] += 1
+        menutree = SidebarPageIndex(self.pagepath)
+        title = "{} - blame".format(self.pagename)
+        if self.revision is not None:
+            title = "{} ({})".format(title, self.revision)
         return render_template(
             "blame.html",
-            title="{} - blame {}".format(self.pagename, self.revision),
+            title=title,
             pagepath=self.pagepath,
             pagename=self.pagename,
             blame=fdata,
             menutree=menutree.query(),
             custom_menu=SidebarMenu().query(),
             breadcrumbs=self.breadcrumbs(),
+            revision=self.revision,
         )
 
     def diff(self, rev_a=None, rev_b=None):
         if not has_permission("READ"):
+            if not current_user.is_authenticated:
+                return redirect(url_for("login", next=request.full_path))
             abort(403)
         # handle case that the page doesn't exists
         self.exists_or_404()
 
-        diff = storage.diff(rev_a, rev_b)
+        try:
+            diff = storage.diff(rev_a, rev_b)
+        except StorageError:
+            abort(404)
         patchset = get_PatchSet(diff)
         url_map = patchset2urlmap(patchset, rev_b, rev_a)
         file_diffs = patchset2filedict(patchset)
 
-        menutree = SidebarPageIndex(get_page_directoryname(self.pagepath))
+        menutree = SidebarPageIndex(self.pagepath)
         return render_template(
             "diff.html",
             title="{} - diff {} {}".format(self.pagename, rev_a, rev_b),
@@ -771,6 +954,8 @@ class Page:
 
     def history(self, rev_a: str | None = None, rev_b: str | None = None):
         if not has_permission("READ"):
+            if not current_user.is_authenticated:
+                return redirect(url_for("login", next=request.full_path))
             abort(403)
 
         self.exists_or_404(in_git=True)
@@ -789,11 +974,13 @@ class Page:
             elif len(orig_log) > 1 and i == 1 and rev_a is None:
                 rev_a = str(orig_entry['revision'])
             entry = dict(orig_entry)
+
             entry["url"] = url_for(
                 "view", path=self.pagepath, revision=entry["revision"]
             )
+
             log.append(entry)
-        menutree = SidebarPageIndex(get_page_directoryname(self.pagepath))
+        menutree = SidebarPageIndex(self.pagepath)
         return render_template(
             "history.html",
             title="{} - History".format(self.pagename),
@@ -807,7 +994,7 @@ class Page:
             breadcrumbs=self.breadcrumbs(),
         )
 
-    def rename(self, new_pagename, message, author):
+    def rename(self, new_pagename, message, author, update_backlinks):
         if not has_permission("WRITE"):
             abort(403)
         # filename
@@ -819,28 +1006,85 @@ class Page:
         if not self.exists and (len(files) + len(directories)) == 0:
             self.exists_or_404()
 
-        if (len(files) + len(directories)) > 0:
-            # rename attachment directory
-            new_attachment_directoryname = get_attachment_directoryname(
-                new_filename
+        # Perform the rename(s) first, deferring the commit. These may fail
+        # (e.g. the target already exists), and we must not rewrite backlinks
+        # in other pages before the rename itself has succeeded - otherwise a
+        # failure would leave those rewrites staged but uncommitted.
+        #
+        # Everything up to and including the commit is staged in the working
+        # tree; if any step raises we roll the paths below back to HEAD so a
+        # partially applied rename never leaves dangling changes behind.
+        # `touched` collects both sides of every rename, since rolling one
+        # back means restoring the old path and dropping the new one.
+        touched = [self.filename, new_filename]
+        try:
+            changed_files = []
+            if (len(files) + len(directories)) > 0:
+                # rename attachment directory
+                new_attachment_directoryname = get_attachment_directoryname(
+                    new_filename
+                )
+                touched += [
+                    self.attachment_directoryname,
+                    new_attachment_directoryname,
+                ]
+                storage.rename(
+                    self.attachment_directoryname,
+                    new_attachment_directoryname,
+                    author=author,
+                    message=message,
+                    no_commit=True,
+                )
+                changed_files.append(new_attachment_directoryname)
+            # rename page
+            if self.exists:
+                storage.rename(
+                    self.filename,
+                    new_filename,
+                    message=message,
+                    author=author,
+                    no_commit=True,
+                )
+                changed_files.append(new_filename)
+
+            # Now that the rename has succeeded, rewrite backlinks in other
+            # pages.
+            pages_updated = (
+                rename_backlinks(self.filename, new_pagename)
+                if update_backlinks
+                else {}
             )
-            # rename attachment directory
-            storage.rename(
-                self.attachment_directoryname,
-                new_attachment_directoryname,
+            changed_files += list(pages_updated.keys())
+            touched += list(pages_updated.keys())
+
+            # Commit the rename together with the rewritten backlinks, so the
+            # repository is never left with uncommitted changes.
+            storage.commit(changed_files, message, author, no_add=True)
+        except Exception:
+            try:
+                storage.restore(touched)
+            except Exception as rollback_error:
+                # never let a failed rollback mask what actually went wrong
+                app.logger.error(
+                    "Rolling back the rename of %s failed: %s",
+                    self.filename,
+                    rollback_error,
+                )
+            raise
+
+        # notify plugins of backlink pages updated. rename_backlinks() keys
+        # its result by filename, since that is what the commit above needs,
+        # but page_saved is documented to carry a pagepath - the same kind of
+        # value Page.save() passes.
+        for filename, content in pages_updated.items():
+            plugin_manager.hook.page_saved(
+                pagepath=get_pagename(filename, full=True),
+                content=content,
                 author=author,
                 message=message,
-                # if self.exists, do not commit yet, commit will follow below, when the md file is renamed
-                # if not self.exists, do commit, since no md file will be renamed
-                no_commit=self.exists,
-            )
-        # rename page
-        if self.exists:
-            storage.rename(
-                self.filename, new_filename, message=message, author=author
             )
 
-    def handle_rename(self, new_pagename, message, author):
+    def handle_rename(self, new_pagename, message, author, update_backlinks):
         if not has_permission("WRITE"):
             abort(403)
         if empty(new_pagename):
@@ -861,7 +1105,8 @@ class Page:
                     self.pagename, new_pagename
                 )
             try:
-                self.rename(new_pagename, message, author)
+                old_pagepath = self.pagepath
+                self.rename(new_pagename, message, author, update_backlinks)
             except Exception as e:
                 # I tried to plumb an error message in here, but it did not show up in the UI - turns out these messages
                 # get stored in the cookie, and some browsers don't like big cookies:
@@ -871,13 +1116,20 @@ class Page:
                 toast("Renaming failed.", "error")
                 app.logger.error(f"Renaming failed: {e}")
             else:
+                # notify plugins
+                plugin_manager.hook.page_renamed(
+                    old_pagepath=old_pagepath,
+                    new_pagepath=new_pagename,
+                    author=author,
+                    message=message,
+                )
                 return redirect(url_for("view", path=new_pagename))
         return self.rename_form(new_pagename, message)
 
     def rename_form(self, new_pagename=None, message=None):
         if not has_permission("WRITE"):
             abort(403)
-        menutree = SidebarPageIndex(get_page_directoryname(self.pagepath))
+        menutree = SidebarPageIndex(self.pagepath)
         olddrafts = Drafts.query.filter_by(pagepath=self.pagepath).all()
         if new_pagename != self.pagepath:
             newdrafts = Drafts.query.filter_by(
@@ -920,6 +1172,12 @@ class Page:
             message=message,
             author=author,
         )
+        # notify plugins
+        plugin_manager.hook.page_deleted(
+            pagepath=self.pagepath,
+            author=author,
+            message=message,
+        )
         toast("{} deleted.".format(self.pagename))
         return redirect(url_for("changelog"))
 
@@ -934,11 +1192,14 @@ class Page:
             )
         else:
             title = "Delete {} ?".format(self.pagename)
+        menutree = SidebarPageIndex(self.pagepath)
         return render_template(
             "delete.html",
             title=title,
             pagepath=self.pagepath,
             pagename=self.pagename,
+            menutree=menutree.query(),
+            custom_menu=SidebarMenu().query(),
         )
 
     def _attachments(self, maximum=None, exclude_extensions=None):
@@ -950,17 +1211,24 @@ class Page:
         # currently only attached files are handled
         return [Attachment(self.pagepath, f) for f in files]
 
-    def render_attachments(self):
-        if not has_permission("READ"):
-            abort(403)
-        # handle case that the page doesn't exists
-        self.exists_or_404()
-        # get all attachments with metadata
+    def _attachments_list(self):
         files = [
             f.data
             for f in self._attachments(exclude_extensions=".md")
             if f.metadata is not None
         ]
+        return files
+
+    def render_attachments(self):
+        if not has_permission("READ"):
+            if not current_user.is_authenticated:
+                return redirect(url_for("login", next=request.full_path))
+            abort(403)
+        # handle case that the page doesn't exists
+        self.exists_or_404()
+        # get all attachments with metadata
+        files = self._attachments_list()
+        menutree = SidebarPageIndex(self.pagepath)
         return render_template(
             "attachments.html",
             title="{} - Attachments".format(self.pagename),
@@ -968,6 +1236,8 @@ class Page:
             pagename=self.pagename,
             files=files,
             breadcrumbs=self.breadcrumbs(),
+            menutree=menutree.query(),
+            custom_menu=SidebarMenu().query(),
         )
 
     def upload_attachments(
@@ -1012,7 +1282,11 @@ class Page:
         if inline:
             if last_uploaded_filename is None:
                 abort(500)
-            return jsonify(filename=f"./{last_uploaded_filename}")
+            # return both the filename and the current attachment list
+            files = self._attachments_list()
+            return jsonify(
+                filename=f"./{last_uploaded_filename}", attachments=files
+            )
         return redirect(url_for("attachments", pagepath=self.pagepath))
 
     def get_attachment(self, filename, revision=None):
@@ -1035,6 +1309,8 @@ class Page:
         self, filename, author, new_filename=None, message=None, delete=None
     ):
         if not has_permission("READ"):
+            if not current_user.is_authenticated:
+                return redirect(url_for("login", next=request.full_path))
             abort(403)
         a = Attachment(self.pagepath, filename)
         if not a.exists():
@@ -1138,6 +1414,22 @@ class Attachment:
         )
         self.filepath = os.path.join(self.directory, filename)
         self.abspath = os.path.join(storage.path, self.filepath)
+        # Guard against path traversal: the resolved attachment path must
+        # stay within the storage repository. Without this a crafted filename
+        # (or pagepath) such as "../../settings.cfg" would allow reading files
+        # outside the wiki repository, e.g. via the DataTable embedding's
+        # `src` option.
+        storage_root = os.path.realpath(storage.path)
+        resolved_abspath = os.path.realpath(self.abspath)
+        if (
+            os.path.commonpath([storage_root, resolved_abspath])
+            != storage_root
+        ):
+            raise StorageError(
+                "Invalid attachment path "
+                f"'{os.path.join(pagepath, filename)}': path traversal "
+                "outside the repository is not allowed."
+            )
         self.mimetype = guess_mimetype(self.filepath)
         try:
             self.metadata = storage.metadata(
@@ -1185,15 +1477,21 @@ class Attachment:
             )
 
     def get_thumbnail_icon(self):
-        if self.mimetype is not None:
-            if self.mimetype == "application/pdf":
-                return (
-                    '<i class="far fa-file-pdf" style="font-size:48px;"></i>'
-                )
-            if self.mimetype.startswith("text"):
-                return (
-                    '<i class="far fa-file-alt" style="font-size:48px;"></i>'
-                )
+        if self.mimetype and self.mimetype.startswith("video/"):
+            return '<i class="far fa-file-video" style="font-size:48px;"></i>'
+        if self.mimetype and self.mimetype in [
+            "application/x-bzip",
+            "application/x-bzip2",
+            "application/zip",
+            "application/x-tar",
+        ]:
+            return (
+                '<i class="far fa-file-archive" style="font-size:48px;"></i>'
+            )
+        if self.mimetype == "application/pdf":
+            return '<i class="far fa-file-pdf" style="font-size:48px;"></i>'
+        if self.mimetype and self.mimetype.startswith("text"):
+            return '<i class="far fa-file-alt" style="font-size:48px;"></i>'
         return '<i class="far fa-file" style="font-size:48px;"></i>'
 
     @property
@@ -1254,6 +1552,8 @@ class Attachment:
 
     def edit(self):
         if not has_permission("READ"):
+            if not current_user.is_authenticated:
+                return redirect(url_for("login", next=request.full_path))
             abort(403)
         if not self.exists():
             return abort(404)
@@ -1277,6 +1577,8 @@ class Attachment:
 
     def get(self):
         if not has_permission("READ"):
+            if not current_user.is_authenticated:
+                return redirect(url_for("login", next=request.full_path))
             abort(403)
         if self.revision is None:
             if not storage.exists(self.filepath):
@@ -1338,6 +1640,11 @@ class Attachment:
             or self.metadata is None
         ):
             abort(404)
+
+        # PIL handles raster formats only; SVG is vector and the browser
+        # scales it natively, so serve the original file.
+        if self.mimetype == "image/svg+xml":
+            return self.get()
 
         t_start = timer()
         image = PIL.Image.open(BytesIO(storage.load(self.filepath, mode="rb")))
@@ -1407,16 +1714,16 @@ class Search:
         if empty(self.query):
             return
         if not self.is_regexp:
-            self.needle = "(" + re.escape(self.query) + ")"
+            self.needle = "(" + regex.escape(self.query) + ")"
         else:
             self.needle = "(" + self.query + ")"
         try:
             # compile regexp
             if self.is_casesensitive:
-                self.re = re.compile(self.needle)
+                self.re = regex.compile(self.needle)
             else:
-                self.re = re.compile(self.needle, re.IGNORECASE)
-            self.rei = re.compile(self.needle, re.IGNORECASE)
+                self.re = regex.compile(self.needle, regex.IGNORECASE)
+            self.rei = regex.compile(self.needle, regex.IGNORECASE)
         except Exception as e:
             toast("Error in search term: {}".format(e), "error")
             return
@@ -1432,11 +1739,17 @@ class Search:
             f"Search storage.list() and filter took {timer() - t_start:.3f} seconds."
         )
         fn_result = {}
+        _regex_timed_out = False
 
         t_start = timer()
         for fn in md_files:
             # check if pagename matches
-            mi = self.rei.search(get_pagename(fn))
+            try:
+                mi = self.rei.search(get_pagename(fn), timeout=_REGEX_TIMEOUT)
+            except regex.TimeoutError:
+                app.logger.warning(f"Search regex timed out on pagename: {fn}")
+                _regex_timed_out = True
+                mi = None
             if mi is not None:
                 fn_result[fn] = [
                     True,
@@ -1446,10 +1759,18 @@ class Search:
                     ),
                 ]
             # open file, read file
-            haystack = storage.load(fn)
+            try:
+                haystack = storage.load(fn)
+            except StorageError:
+                continue
             lastlinematched = False
             for i, line in enumerate(haystack.splitlines()):
-                m = self.re.search(line)
+                try:
+                    m = self.re.search(line, timeout=_REGEX_TIMEOUT)
+                except regex.TimeoutError:
+                    app.logger.warning(f"Search regex timed out on file: {fn}")
+                    _regex_timed_out = True
+                    m = None
                 if m:
                     if fn not in fn_result:
                         fn_result[fn] = [False]
@@ -1480,9 +1801,23 @@ class Search:
             for i, line in enumerate(matches):
                 # filenames are not casesensitive ...
                 if i == 0 and fnmatch == 1:
-                    n += len(self.rei.findall(line))
+                    try:
+                        n += len(
+                            self.rei.findall(line, timeout=_REGEX_TIMEOUT)
+                        )
+                    except regex.TimeoutError:
+                        app.logger.warning(
+                            "Search regex timed out on findall (rei)"
+                        )
+                        _regex_timed_out = True
                 else:
-                    n += len(self.re.findall(line))
+                    try:
+                        n += len(self.re.findall(line, timeout=_REGEX_TIMEOUT))
+                    except regex.TimeoutError:
+                        app.logger.warning(
+                            "Search regex timed out on findall (re)"
+                        )
+                        _regex_timed_out = True
             key = [
                 fnmatch,
                 n,
@@ -1494,9 +1829,15 @@ class Search:
             if fnmatch == 1:
                 summary = [matches.pop(0)]
                 # overwrite key[4]
-                key[4] = self.rei.sub(
-                    r'<span class="page-match">\1</span>', cast(str, key[4])
-                )
+                try:
+                    key[4] = self.rei.sub(
+                        r'<span class="page-match">\1</span>',
+                        cast(str, key[4]),
+                        timeout=_REGEX_TIMEOUT,
+                    )
+                except regex.TimeoutError:
+                    app.logger.warning("Search regex timed out on rei.sub")
+                    _regex_timed_out = True
             front, end = [], []
             while len("".join(front) + "".join(end)) < 200:
                 try:
@@ -1520,19 +1861,33 @@ class Search:
                 if i == 0 and fnmatch == 1:
                     summary[i] = None
                 else:
-                    summary[i] = self.re.sub(
-                        r'<span class="text-match">\1</span>', l
-                    )
+                    try:
+                        summary[i] = self.re.sub(
+                            r'<span class="text-match">\1</span>',
+                            l,
+                            timeout=_REGEX_TIMEOUT,
+                        )
+                    except regex.TimeoutError:
+                        app.logger.warning("Search regex timed out on re.sub")
+                        _regex_timed_out = True
+                        summary[i] = l
             # store summary with key
             result[tuple(key)] = summary
         app.logger.debug(
             f"Search simplify result took {timer() - t_start:.3f} seconds."
         )
+        if _regex_timed_out:
+            toast(
+                "Search regex timed out. Results may be incomplete.",
+                "warning",
+            )
 
         return result
 
     def render(self):
         if not has_permission("READ"):
+            if not current_user.is_authenticated:
+                return redirect(url_for("login", next=request.full_path))
             abort(403)
         self.compile()
         result = self.search()
@@ -1619,6 +1974,10 @@ class AutoRoute:
             revision = None
         # create page object
         p = Page(self.path, revision=revision)
+        # if the pagename is empty because it has been sanitized, redirect to /
+        if not empty(self.path) and empty(p.pagepath):
+            toast("Invalid pagename.", "error")
+            return redirect(url_for("index"))
         # if page md doesn't exist, but the folder exists, show index
         if not storage.exists(p.filename) and storage.exists(
             p.attachment_directoryname

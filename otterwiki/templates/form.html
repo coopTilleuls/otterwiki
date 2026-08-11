@@ -4,6 +4,8 @@
 {{ super() }}
 <meta name="robots" content="noindex, nofollow"/>
 {% endblock %}
+{# disables the content-wrapper autofocus in layout.html so the form input below keeps focus #}
+{% block disable_autofocus %}1{% endblock %}
 {% block content %}
 <div class="col-sm-12 col-md-12 col-lg-10">
 <div class="card">

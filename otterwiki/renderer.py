@@ -2,23 +2,23 @@
 # vim: set et ts=8 sts=4 sw=4 ai:
 
 import re
-
 import mistune
+import urllib.parse
 from bs4 import BeautifulSoup
 from markupsafe import Markup, escape
-from mistune.plugins import (
-    plugin_strikethrough,
-    plugin_table,
-    plugin_url,
-    plugin_abbr,
-)
+from mistune.plugins.formatting import strikethrough as plugin_strikethrough
+from mistune.plugins.table import table as plugin_table, table_in_list
+from mistune.plugins.url import url as plugin_url
+from mistune.plugins.abbr import abbr as plugin_abbr
+from mistune.util import striptags as mistune_striptags
+from pygments.formatters import HtmlFormatter
 from pygments import highlight
-from pygments.formatters import html
 from pygments.lexers import get_lexer_by_name
 from pygments.util import ClassNotFound
 
 from otterwiki.plugins import chain_hooks
 from otterwiki.renderer_plugins import (
+    mistunePluginAlerts,
     plugin_alerts,
     plugin_fancy_blocks,
     plugin_fold,
@@ -30,20 +30,26 @@ from otterwiki.renderer_plugins import (
     plugin_wikilink,
     plugin_frontmatter,
     plugin_frontmatter_title,
+    plugin_embeddings,
+    plugin_strict_tables,
+    plugin_table_gfm_pipes,
 )
-from otterwiki.util import empty, slugify
-
-# the cursor magic word which is ignored by the rendering
-cursormagicword = "CuRsoRm4g1cW0Rd"
+from otterwiki.util import empty, slugify, cursormagicword
 
 #
-# patch mistune table_plugin so that not all the newlines at the end of a table are removed
+# patch mistune helpers to support parenthesis-delimited link titles per CommonMark spec.
+# mistune 3.2.0 only recognises "title" and 'title' forms; adding (...) fixes link
+# reference definitions like: [modeline]: # ( vim: set ft=markdown: )
 #
-mistune.plugins.plugin_table.TABLE_PATTERN = re.compile(  # pyright: ignore
-    r' {0,3}\|(.+)\n *\|( *[-:]+[-| :]*)\n((?: *\|.*(?:\n|$))*)\n{0,1}'
-)
-mistune.plugins.plugin_table.NP_TABLE_PATTERN = re.compile(  # pyright: ignore
-    r' {0,3}(\S.*\|.*)\n *([-:]+ *\|[-| :]*)\n((?:.*\|.*(?:\n|$))*)\n{0,1}'
+import string as _string
+
+_PUNCTUATION = r"[" + re.escape(_string.punctuation) + r"]"
+mistune.helpers.LINK_TITLE_RE = re.compile(  # pyright: ignore
+    r"[ \t\n]+("
+    r'"(?:\\' + _PUNCTUATION + r'|[^"\x00])*"|'  # "title"
+    r"'(?:\\" + _PUNCTUATION + r"|[^'\x00])*'|"  # 'title'
+    r"\((?:\\" + _PUNCTUATION + r"|[^()\x00])*\)"  # (title)
+    r")"
 )
 
 
@@ -51,8 +57,7 @@ def _pre_copy_to_clipboard_tag():
     return f"""<div class="copy-to-clipboard-outer"><div class="copy-to-clipboard-inner"><button class="btn alt-dm btn-xsm copy-to-clipboard" type="button"  onclick="otterwiki.copy_to_clipboard(this);"><i class="fa fa-copy" aria-hidden="true" alt="Copy to clipboard""></i></button></div><pre class="copy-to-clipboard code">"""
 
 
-class CodeHtmlFormatter(html.HtmlFormatter):
-
+class CodeHtmlFormatter(HtmlFormatter):
     def wrap(self, source):
         yield 0, _pre_copy_to_clipboard_tag()
         for i, t in source:
@@ -102,83 +107,152 @@ def showmagicword(line, html):
     return "".join(arr)
 
 
-def clean_html(html: str) -> str:
-    # use BeautifulSoup to identify tags we want to remove / escape
-    # since we get incomplete tags via inline html we have to work
-    # with the html string and can not use what bs makes out of it
-    REMOVE_ATTRIBUTES = [
-        'onclick',
-        'onload',
-        'onerror',
-        'onfocus',
-        'onbeforeprint',
-        'beforeunload',
-        'onblur',
-        'onchange',
-        'oncopy',
-        'oncut',
-        'ondblclick',
-        'ondrag',
-        'draggable',
-        'ondragend',
-        'ondragenter',
-        'ondragleave',
-        'ondragover',
-        'ondragstart',
-        'ondrop',
-        'onfocus',
-        'onfocusin',
-        'onfocusout',
-        'onhashchange',
-        'oninput',
-        'oninvalid',
-        'onkeydown',
-        'onkeypress',
-        'onkeyup',
-        'onload',
-        'onmousedown',
-        'onmouseenter',
-        'onmouseleave',
-        'onmousemove',
-        'onmouseover',
-        'onmouseout',
-        'onmouseup',
-        'onoffline',
-        'ononline',
-        'onpagehide',
-        'onpageshow',
-        'onpaste',
-        'onresize',
-        'onreset',
-        'onscroll',
-        'onsearch',
-        'onselect',
-        'ontoggle',
-        'ontouchcancel',
-        'ontouchend',
-        'ontouchmove',
-        'ontouchstart',
-        'onunload',
-    ]
-    REMOVE_TAGS = ['style', 'script', 'blink', 'marque']
+def parse_custom_allowlist(custom_allowlist: str = None) -> tuple:
+    """
+    Parse custom allowlist string into tags and attributes dictionaries.
+    """
+    custom_tags = []
+    custom_attributes = {}
 
-    _escape = False
+    if custom_allowlist and custom_allowlist.strip():
+        for item in custom_allowlist.split(','):
+            item = item.strip()
+            if not item:
+                continue
+
+            # to separate tag from attributes
+            parts = item.split('[', 1)
+            tag_name = parts[0].strip().lower()
+
+            if tag_name:
+                custom_tags.append(tag_name)
+
+            if len(parts) > 1:
+                attrs_str = parts[1].rstrip(']').strip()
+                if attrs_str:
+                    attrs = [
+                        attr.strip().lower()
+                        for attr in attrs_str.split()
+                        if attr.strip()
+                    ]
+                    if attrs:
+                        custom_attributes[tag_name] = attrs
+
+    return custom_tags, custom_attributes
+
+
+def clean_html(
+    html: str, custom_tags: list = None, custom_attributes: dict = None
+) -> str:
+    """
+    Clean HTML using an allowlist approach - only allow safe tags and attributes.
+    This prevents XSS attacks via various vectors like:
+    - <script> tags
+    - Event handlers (onclick, onload, onbegin, etc.)
+    - Dangerous protocols (javascript:, data:)
+    - Dangerous tags (object, embed, iframe, svg with events, etc.)
+    """
+
+    # tags and attrs are logically groupped by types
+    # fmt: off
+    ALLOWED_TAGS = [
+        'p', 'br', 'hr', 'span', 'div', 'i',
+        'strong', 'em', 'b', 'i', 'u', 's', 'strike', 'del', 'ins', 'sub', 'sup', 'mark', 'small',
+        'ul', 'ol', 'li', 'dl', 'dt', 'dd',
+        'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+        'code', 'pre', 'kbd', 'samp', 'var',
+        'blockquote', 'q', 'cite',
+        'table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th', 'caption', 'col', 'colgroup',
+        'a', 'img',
+        'abbr', 'address', 'time', 'details', 'summary',
+        'video', 'audio', 'source',
+        'input','label'
+    ]
+
+    ALLOWED_ATTRIBUTES = {
+        'a': ['href', 'title', 'name', 'id', 'class'],
+        'img': ['src', 'alt', 'title', 'width', 'height', 'class'],
+        'abbr': ['title'],
+        'time': ['datetime'],
+        'td': ['colspan', 'rowspan', 'align', 'valign', 'width'],
+        'th': ['colspan', 'rowspan', 'align', 'valign', 'scope', 'width'],
+        'col': ['span', 'width'],
+        'colgroup': ['span', 'width'],
+        'table': ['border', 'cellpadding', 'cellspacing', 'width'],
+        'video': ['controls', 'width', 'height', 'poster'],
+        'source': ['src', 'type'],
+        'audio': ['controls', 'src'],
+        'input': ['type', 'checked', 'id', 'value'],
+        'label': ['for'],
+        'span' : ['role'],
+        # generic attributes allowed on most tags
+        '*': ['id', 'class', 'title', 'style'],
+    }
+    # fmt: on
+
+    DANGEROUS_PROTOCOLS = [
+        'javascript:',
+        'data:',
+        'vbscript:',
+        'file:',
+        'about:',
+    ]
+
+    # extend with custom user-defined tags and attributes
+    if custom_tags:
+        for tag_name in custom_tags:
+            if tag_name and tag_name not in ALLOWED_TAGS:
+                ALLOWED_TAGS.append(tag_name)
+
+    if custom_attributes:
+        for tag_name, attrs in custom_attributes.items():
+            if tag_name in ALLOWED_ATTRIBUTES:
+                ALLOWED_ATTRIBUTES[tag_name] = (
+                    ALLOWED_ATTRIBUTES[tag_name] + attrs
+                )
+            else:
+                ALLOWED_ATTRIBUTES[tag_name] = attrs
+
     soup = BeautifulSoup(html, 'html.parser')
-    for element in soup:
-        if element.name in REMOVE_TAGS:  # pyright: ignore
+    _escape = False
+
+    for element in soup.find_all(True):
+        if not hasattr(element, 'name') or element.name is None:
+            continue
+
+        if element.name.lower() not in ALLOWED_TAGS:
             _escape = True
             break
-        try:
-            if any(
-                x in element.attrs.keys()  # pyright: ignore
-                for x in REMOVE_ATTRIBUTES
-            ):
-                _escape = True
-                break
-        except AttributeError:
-            continue
+
+        if hasattr(element, 'attrs'):
+            tag_name_lower = element.name.lower()
+            allowed_attrs = ALLOWED_ATTRIBUTES.get(
+                tag_name_lower, []
+            ) + ALLOWED_ATTRIBUTES.get('*', [])
+
+            for attr_name, attr_value in list(element.attrs.items()):
+                attr_name_lower = attr_name.lower()
+
+                if attr_name_lower not in allowed_attrs:
+                    _escape = True
+                    break
+
+                if attr_name_lower in ['href', 'src', 'poster']:
+                    if isinstance(attr_value, str):
+                        attr_lower = attr_value.lower().strip()
+                        for protocol in DANGEROUS_PROTOCOLS:
+                            if attr_lower.startswith(protocol):
+                                _escape = True
+                                break
+
+                if _escape:
+                    break
+
+        if _escape:
+            break
+
     if _escape:
-        # take nom prisoners
+        # take no prisoners
         html = escape(html)
 
     return html
@@ -189,32 +263,111 @@ class OtterwikiMdRenderer(mistune.HTMLRenderer):
     toc_tree = []
     toc_anchors = {}
 
-    def __init__(self, env, *args, **kwargs):
+    def __init__(self, env, custom_allowlist=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.env = env
+        self.custom_tags, self.custom_attributes = parse_custom_allowlist(
+            custom_allowlist
+        )
 
     def inline_html(self, html):
-        return clean_html(html)
+        return clean_html(
+            html,
+            custom_tags=self.custom_tags,
+            custom_attributes=self.custom_attributes,
+        )
 
     def block_html(self, html):
-        return clean_html(html)
+        return clean_html(
+            html,
+            custom_tags=self.custom_tags,
+            custom_attributes=self.custom_attributes,
+        )
 
     def reset_toc(self):
         self.toc_count = 0
         self.toc_tree = []
         self.toc_anchors = {}
 
-    def image(self, src, alt="", title=None):
+    def image(self, text, url="", title=None):
+        # text is rendered alt children; strip tags for the alt attribute
+        alt = mistune.escape(mistune_striptags(text))
+        # escape url and title
+        if title:
+            title = mistune.escape(title)
+        src = mistune.escape_url(self.safe_url(url))
+
         if not empty(title):
-            return (
+            image_html = (
                 '<img src="{}" class="img-fluid" title="{}" alt="{}">'.format(
                     src, title, alt
                 )
             )
-        return '<img src="{}" class="img-fluid" alt="{}">'.format(src, alt)
+        else:
+            image_html = '<img src="{}" class="img-fluid" alt="{}">'.format(
+                src, alt
+            )
+
+        processed_html = chain_hooks(
+            "renderer_process_image",
+            image_html,
+            src,
+            alt,
+            title,
+            self.env.get('page'),
+        )
+        return processed_html
+
+    def link(self, text, url=None, title=None):
+        if empty(text):
+            # the url is used as visible text, escape it so sequences
+            # like &reg are not interpreted as html entities (issue #545)
+            text = mistune.escape(url)
+
+        # escape url
+        link = mistune.escape_url(self.safe_url(url))
+
+        open_in_new_tab = self.env.get("config", {}).get(
+            "OPEN_LINKS_IN_NEW_TAB", False
+        )
+
+        attrs = []
+
+        # escape the url again for the html attribute context. escape_url
+        # leaves a bare '&' behind (its internal unescape undoes the escaping
+        # done by safe_url), which the final BeautifulSoup pass would otherwise
+        # decode as an html entity, e.g. a trailing &reg becoming ® (issue #545)
+        attrs.append('href="{}"'.format(mistune.escape(link)))
+
+        if title:
+            attrs.append('title="{}"'.format(mistune.escape(title)))
+
+        if open_in_new_tab and self.is_external_link(link):
+            attrs.append('class=external')
+            attrs.append('target=_blank')
+
+        link_html = '<a {}>{}</a>'.format(' '.join(attrs), text)
+
+        processed_html = chain_hooks(
+            "renderer_process_link",
+            link_html,
+            link,
+            text,
+            title,
+            self.env.get('page'),
+        )
+        return processed_html
+
+    def is_external_link(self, link):
+        parsed_link = urllib.parse.urlparse(link)
+
+        return parsed_link.scheme in ('http', 'https')
 
     def codespan(self, text):
-        if text.startswith("$") and text.endswith("$"):
+        if len(text) >= 3 and text.startswith("$") and text.endswith("$"):
+            # mark that MathJax is required
+            if hasattr(self, 'renderer'):
+                self.renderer.requires_mathjax = True
             return "\\(" + mistune.escape(text[1:-1]) + "\\)"
         return "<code>" + mistune.escape(text) + "</code>"
 
@@ -236,16 +389,21 @@ class OtterwikiMdRenderer(mistune.HTMLRenderer):
             linenumbers = True
         cursorline, code = hidemagicword(code)
         if info == "math":
+            # mark that MathJax is required
+            if hasattr(self, 'renderer'):
+                self.renderer.requires_mathjax = True
             html = "".join(
                 ["\\[{}\\]".format(line) for line in code.strip().splitlines()]
             )
         elif info == "mermaid":
-            html = "".join(
-                ["\\[{}\\]".format(line) for line in code.strip().splitlines()]
-            )
+            # mark that Mermaid is required
+            if hasattr(self, 'renderer'):
+                self.renderer.requires_mermaid = True
             # replace \n with <br/> for convenient diagram writing (and match the github syntax)
             code = code.replace("\\n", "<br/>")
-            html = '\n<pre class="mermaid">{}\n</pre>\n'.format(code.strip())
+            html = '\n<pre class="mermaid">{}\n</pre>\n'.format(
+                escape(code.strip())
+            )
             return html
         else:
             html = prefix + pygments_render(
@@ -254,7 +412,7 @@ class OtterwikiMdRenderer(mistune.HTMLRenderer):
         html = showmagicword(cursorline, html)
         return prefix + html
 
-    def heading(self, text, level):
+    def heading(self, text, level, **attrs):
         raw = Markup(text).striptags()
         anchor = slugify(raw)
         try:
@@ -269,53 +427,135 @@ class OtterwikiMdRenderer(mistune.HTMLRenderer):
             text=text,
             anchor=anchor,
         )
+
+        processed_html = chain_hooks(
+            "renderer_process_heading",
+            rv,
+            text,
+            level,
+            anchor,
+            self.env.get('page'),
+        )
+
         self.toc_tree.append((self.toc_count, text, level, raw, anchor))
         self.toc_count += 1
-        return rv
+        return processed_html
 
 
 class OtterwikiBlockParser(mistune.BlockParser):
     INDENT_CODE = re.compile(r'((?:\n*)(?:(?: {4}| *\t)[^\n]+\n*)+)\n')
 
+    # Pattern to detect alert syntax in the first line of a blockquote
+    _ALERT_DETECT = re.compile(
+        r'\s*\[!(?:' + mistunePluginAlerts.TYPES_WITH_PIPES + r')\]',
+        re.I,
+    )
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+    # Pattern to detect fold syntax (>|) in the first line of a blockquote
+    _FOLD_DETECT = re.compile(r'\|')
+
+    # Pattern to detect spoiler syntax (>!) in the first line of a blockquote
+    _SPOILER_DETECT = re.compile(r'!')
+
+    def _try_redirect(self, token_type, detect_re, m, state):
+        """Re-match a blockquote as a different block type.
+
+        When mistune's list parser matches a ``>``-prefixed line as a
+        ``block_quote`` break, custom block types (alerts, folds,
+        spoilers) are bypassed.  This helper checks whether the quoted
+        content actually matches *detect_re* and, if the corresponding
+        *token_type* parser is registered, re-scans from the match
+        start so the correct parser handles it.
+        """
+        if token_type not in self._methods:
+            return None
+        if not detect_re.match(m.group('quote_1')):
+            return None
+        sc = self.compile_sc([token_type])
+        m2 = sc.match(state.src, m.start())
+        if m2:
+            return self._methods[token_type](m2, state)
+        return None
+
+    def parse_block_quote(self, m, state):
+        """Override to detect alerts/folds/spoilers matched as blockquotes.
+
+        This handles the case where a blockquote-like pattern (e.g.
+        ``> [!TIP]``, ``>|``, ``>!``) is matched by mistune's list
+        parser as a ``block_quote`` break, bypassing the dedicated
+        scanner.
+        """
+        for token_type, detect_re in (
+            ('alert_block', self._ALERT_DETECT),
+            ('fold_block', self._FOLD_DETECT),
+            ('spoiler_block', self._SPOILER_DETECT),
+        ):
+            result = self._try_redirect(token_type, detect_re, m, state)
+            if result is not None:
+                return result
+        return super().parse_block_quote(m, state)
+
     def parse_indent_code(self, m, state):
         """
-        Overrides mistunes rendering, since mistune catches one \n too much
+        Overrides mistunes rendering, since mistune catches one \\n too much.
+        Re-match the v3 scanner's group(0) against our custom INDENT_CODE regex
+        so that group(1) strips the extra trailing blank-line newlines exactly
+        as v2 did.
         """
-        raw = m.group(1)
+        m2 = self.INDENT_CODE.match(m.group(0))
+        raw = m2.group(1) if m2 else m.group(0)
         text = mistune.block_parser.expand_leading_tab(raw)
         code = mistune.block_parser._INDENT_CODE_TRIM.sub(  # pyright: ignore
             '', text
         )
         code = code.lstrip('\n')
-        return self.tokenize_block_code(code, None, state)
+        state.append_token(
+            {"type": "block_code", "raw": code, "style": "indent"}
+        )
+        return m.end()
 
 
 class OtterwikiInlineParser(mistune.InlineParser):
-    def __init__(self, env, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, env, hard_wrap=False):
+        super().__init__(hard_wrap=hard_wrap)
         self.env = env
 
-    def parse_std_link(self, m, state):
-        line = m.group(0)
-        text = m.group(1)
-        link = mistune.inline_parser.ESCAPE_CHAR.sub(r'\1', m.group(2))
-        if link.startswith('<') and link.endswith('>'):
-            link = link[1:-1]
-        elif link.startswith("./"):
-            if self.env.get("PAGE_URL", None) is not None:
-                link = self.env["PAGE_URL"] + "/" + link
+    def parse_codespan(self, m, state):
+        # Override: replace only newlines with spaces (not multiple spaces),
+        # preserving internal whitespace beyond what the standard parser strips.
+        marker = m.group(0)
+        pattern = re.compile(r"(.*?[^`])" + marker + r"(?!`)", re.S)
+        pos = m.end()
+        m2 = pattern.match(state.src, pos)
+        if m2:
+            end_pos = m2.end()
+            code = m2.group(1)
+            # Replace newlines with spaces (our custom behaviour)
+            code = re.sub(r'\n+', ' ', code)
+            state.append_token({"type": "codespan", "raw": code})
+            return end_pos
+        else:
+            state.append_token({"type": "text", "raw": marker})
+            return pos
 
-        title = m.group(3)
-        if title:
-            title = mistune.inline_parser.ESCAPE_CHAR.sub(r'\1', title[1:-1])
-
-        if line[0] == '!':
-            return 'image', mistune.escape_url(link), text, title
-
-        return self.tokenize_link(line, link, text, title, state)
+    def parse_link(self, m, state):
+        # Call the standard v3 link parser first
+        result = super().parse_link(m, state)
+        if result is None:
+            return result
+        # Post-process: if the last token is a link/image with a ./relative URL,
+        # prepend the PAGE_URL
+        page_url = self.env.get("PAGE_URL")
+        if page_url and state.tokens:
+            last = state.tokens[-1]
+            if last.get("type") in ("link", "image") and last.get("attrs"):
+                url = last["attrs"].get("url", "")
+                if url.startswith("./"):
+                    last["attrs"]["url"] = page_url + "/" + url
+        return result
 
 
 class OtterwikiMdParser(mistune.Markdown):
@@ -333,9 +573,21 @@ class OtterwikiRenderer:
         self.env = {
             "config": config,
         }
-        self.md_renderer = OtterwikiMdRenderer(env=self.env)
+        self.requires_mermaid = False
+        self.requires_mathjax = False
+        self.requires_datatables = True
+
+        custom_allowlist = (
+            config.get('RENDERER_HTML_ALLOWLIST', '').strip() or None
+        )
+        self.md_renderer = OtterwikiMdRenderer(
+            env=self.env, custom_allowlist=custom_allowlist
+        )
+
+        # set reference to renderer in md_renderer for library requirement tracking
+        self.md_renderer.renderer = self
         self.inline_parser = OtterwikiInlineParser(
-            env=self.env, renderer=self.md_renderer, hard_wrap=False
+            env=self.env, hard_wrap=False
         )
         self.block_parser = OtterwikiBlockParser()
 
@@ -345,6 +597,8 @@ class OtterwikiRenderer:
             block=self.block_parser,
             plugins=[
                 plugin_table,
+                plugin_strict_tables,
+                plugin_table_gfm_pipes,
                 plugin_url,
                 plugin_strikethrough,
                 plugin_task_lists,
@@ -359,17 +613,27 @@ class OtterwikiRenderer:
                 plugin_frontmatter,
                 plugin_frontmatter_title,
                 plugin_abbr,
+                plugin_embeddings,
             ],
             env=self.env,
         )
         self.lastword = re.compile(r"([a-zA-Z\-0-9\.]+)$")
+        # lines that end with renderable content but no trailing word to
+        # attach the cursor to (e.g. pasted images or links in a list);
+        # the cursor is appended at the end of such lines
+        self.contentlines = [
+            re.compile(r"!\[[^\]]*\]\([^)]*\)\s*$"),  # image
+            re.compile(r"\[[^\]]*\]\([^)]*\)\s*$"),  # link
+        ]
         self.htmlcursor = " <span id=\"otterwiki_cursor\"></span> "
         # thanks to https://github.com/lepture/mistune/issues/158#issuecomment-830481284
         # we can enable tables in lists
-        self.mistune.block.list_rules += ['table', 'nptable']  # pyright:ignore
+        table_in_list(self.mistune)
 
     def markdown(self, text, cursor=None, **kwargs):
         self.md_renderer.reset_toc()
+        self.requires_mermaid = False
+        self.requires_mathjax = False
         # do the preparsing
         text = chain_hooks("renderer_markdown_preprocess", text)
         # to avoid that preparsing removes the trailing newline and to be
@@ -387,17 +651,29 @@ class OtterwikiRenderer:
                 line = 0
             # find a line to place the cursor
             while line > 0 and (
-                not len(self.lastword.findall(text_arr[line])) > 0
+                (
+                    not len(self.lastword.findall(text_arr[line])) > 0
+                    and not any(
+                        p.search(text_arr[line]) for p in self.contentlines
+                    )
+                )
                 or text_arr[line].startswith(
                     "---"
                 )  # --- (hr) needs extra space
             ):
                 line -= 1
             if line > 0:
-                # add empty span at the beginning of the edited line
-                text_arr[line] = self.lastword.sub(
-                    r"\1{}".format(cursormagicword), text_arr[line], count=1
-                )
+                if len(self.lastword.findall(text_arr[line])) > 0:
+                    # add empty span after the last word of the edited line
+                    text_arr[line] = self.lastword.sub(
+                        r"\1{}".format(cursormagicword),
+                        text_arr[line],
+                        count=1,
+                    )
+                else:
+                    # no trailing word (e.g. a line ending with an image
+                    # or link), append the cursor right after it
+                    text_arr[line] = text_arr[line] + cursormagicword
                 text = "\n".join(text_arr)
         else:
             line = 0
@@ -413,7 +689,35 @@ class OtterwikiRenderer:
         toc = self.md_renderer.toc_tree.copy()
         if cursor is not None and line > 0:
             # replace the magic word with the cursor span
-            html = html.replace(cursormagicword, self.htmlcursor)
+
+            # we have to make sure that the cursormagicword is not placed inside an element
+            # which might break the html after replacing it with self.htmlcursor
+
+            # find the line with the magic word
+            lines = html.splitlines(True)
+            for i, line in enumerate(lines):
+                if cursormagicword in line:
+                    # parse with bs4
+                    soup = BeautifulSoup(line, 'html.parser')
+                    prepend_cursor = False
+                    for element in soup.find_all():
+                        for attr_key, attr_value in element.attrs.items():
+                            if cursormagicword in attr_value:
+                                prepend_cursor = True
+                                # remove cursormagicword from attr
+                                element.attrs[attr_key] = attr_value.replace(
+                                    cursormagicword, ""
+                                )
+                        if prepend_cursor:
+                            element.insert_before(cursormagicword)
+                    # only use the bs4 string if it has been used
+                    if prepend_cursor:
+                        line = str(soup)
+                    lines[i] = line.replace(cursormagicword, self.htmlcursor)
+                    # dont check other lines, there is only one cursor.
+                    break
+
+            html = "".join(lines)
         elif cursor is not None:
             html = self.htmlcursor + html
 
@@ -437,7 +741,15 @@ class OtterwikiRenderer:
         soup = BeautifulSoup(html, 'html.parser')
         html = str(soup)
 
-        return html, toc
+        return (
+            html,
+            toc,
+            {
+                'requires_mermaid': self.requires_mermaid,
+                'requires_mathjax': self.requires_mathjax,
+                'requires_datatables': self.requires_datatables,
+            },
+        )
 
 
 # unconfigured renderer for testing and rendering about()

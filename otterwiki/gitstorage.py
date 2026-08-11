@@ -11,9 +11,15 @@ import git
 import git.exc
 
 from otterwiki.util import split_path, ttl_lru_cache
+from otterwiki.repomgmt import get_repo_manager
+from otterwiki.plugins import plugin_manager
 
 
 class StorageError(Exception):
+    pass
+
+
+class StorageErrorEncoding(StorageError):
     pass
 
 
@@ -25,6 +31,11 @@ try:
     FileNotFoundError
 except NameError:
     FileNotFoundError = IOError
+
+
+# a revision otterwiki itself produces: a hex commit SHA (prefix or full,
+# sha1 = 40 / sha256 = 64), or the literal HEAD used as the blame default.
+_REVISION_RE = re.compile(r"\A(?:HEAD|[0-9a-fA-F]{4,64})\Z")
 
 
 class GitStorage(object):
@@ -50,6 +61,45 @@ class GitStorage(object):
             os.remove(os.path.join(self.path, ".git/RELOAD_GIT"))
             self.repo = self._read_repo()
 
+    def _validate_revision(self, revision):
+        """
+        Accept only the revision forms otterwiki generates: a hex commit
+        SHA (prefix or full) or the literal HEAD. This is an allowlist, so
+        it rejects the leading '-' that enables git argument injection
+        (CWE-88) *and* anything else that is not a plausible commit-ish,
+        rather than trying to model git's full revision grammar.
+
+        Raise StorageNotFound (not just StorageError) so callers treat an
+        invalid revision exactly like a revision that does not exist: a
+        uniform 404, with no oracle that distinguishes a blocked payload
+        from an unknown commit.
+        """
+        if revision is None or not _REVISION_RE.match(str(revision)):
+            raise StorageNotFound("Invalid revision: {!r}".format(revision))
+
+    def notify_repository_changed_from_external(self):
+        """
+        Notify plugins about repository changes from external sources
+        (git web server, automatic pulls, etc.).
+        This method detects what files changed in the last commit.
+        """
+        try:
+            last_commit = self.repo.head.commit
+            changed_files = list(last_commit.stats.files.keys())
+            if changed_files:
+                plugin_manager.hook.repository_changed(
+                    changed_files=changed_files
+                )
+        except Exception as e:
+            try:
+                from otterwiki.server import app
+
+                app.logger.error(
+                    f"Failed to notify plugins of repository change: {e}"
+                )
+            except ImportError:
+                pass
+
     def exists(self, filename):
         return os.path.exists(os.path.join(self.path, filename))
 
@@ -73,20 +123,34 @@ class GitStorage(object):
     def load(self, filename, mode="r", revision=None, size=-1):
         self._check_reload()
         if revision is not None:
+            self._validate_revision(revision)
             try:
                 content = self.repo.git.show(
                     "{}:{}".format(revision, filename)
                 )
                 if mode == "rb":
                     content = content.encode("utf8", "surrogateescape")
+                else:
+                    # git show uses surrogateescape for non-UTF-8 bytes,
+                    # which produces surrogate characters that cannot be
+                    # encoded back to UTF-8. Detect this early.
+                    content.encode("utf8")
             except git.exc.GitCommandError:
                 raise StorageNotFound
+            except (UnicodeDecodeError, UnicodeEncodeError):
+                raise StorageErrorEncoding(
+                    "{} could not be decoded as text.".format(filename)
+                )
             return content
         try:
             with open(os.path.join(self.path, filename), mode=mode) as f:
                 content = f.read(size)
         except (IOError, FileNotFoundError):
             raise StorageNotFound("{} not found.".format(filename))
+        except UnicodeDecodeError:
+            raise StorageErrorEncoding(
+                "{} could not be decoded as text.".format(filename)
+            )
         return content
 
     @ttl_lru_cache(maxsize=128, ttl=60)
@@ -139,6 +203,7 @@ class GitStorage(object):
     def blame(self, filename, revision=None):
         if revision is None:
             revision = "HEAD"
+        self._validate_revision(revision)
         try:
             commits = list(self.repo.blame(revision, filename) or [])
         except (ValueError, IndexError, git.exc.GitCommandError):
@@ -166,6 +231,7 @@ class GitStorage(object):
                         metadata["datetime"],
                         n,
                         line,
+                        metadata["message"],
                     )
                 )
                 # increase linenumber
@@ -279,16 +345,12 @@ class GitStorage(object):
         # build and return logfile
         return [self._get_metadata_of_commit(commit) for commit in commits]
 
-    def store(
+    def update(
         self,
         filename,
         content,
-        message: str | None = "",
-        author=("", ""),
         mode="w",
     ):
-        if message is None:
-            message = ""
         dirname = os.path.dirname(filename)
         if dirname != "":
             os.makedirs(
@@ -301,11 +363,40 @@ class GitStorage(object):
         diff = self.repo.index.diff(None, paths=filename)
         if len(diff) == 0 and filename not in self.repo.untracked_files:
             return False
-        # add and commit to git
+
+        # add to git
         index = self.repo.index
         index.add([filename])
+
+        return True
+
+    def store(
+        self,
+        filename,
+        content,
+        message: str | None = "",
+        author=("", ""),
+        mode="w",
+    ):
+        # write the file and stage the change in git
+        if not self.update(filename, content, mode):
+            return False
+
+        if message is None:
+            message = ""
+
+        # commit to git
+        index = self.repo.index
         actor = git.Actor(author[0], author[1])
         index.commit(message, author=actor)
+
+        plugin_manager.hook.repository_changed(changed_files=[filename])
+
+        # auto-push after storing file
+        repo_manager = get_repo_manager()
+        if repo_manager:
+            repo_manager.auto_push_if_enabled()
+
         return True
 
     def commit(self, filenames, message="", author=("", ""), no_add=False):
@@ -321,7 +412,72 @@ class GitStorage(object):
         actor = git.Actor(author[0], author[1])
         index.commit(message, author=actor)
 
+        changed_list = (
+            filenames if isinstance(filenames, list) else [filenames]
+        )
+        plugin_manager.hook.repository_changed(changed_files=changed_list)
+
+        # auto-push after commit
+        repo_manager = get_repo_manager()
+        if repo_manager:
+            repo_manager.auto_push_if_enabled()
+
+    def _known_paths(self, paths, revision):
+        """Filter `paths` down to what git knows about, either in the index
+        or in `revision`.
+
+        `git restore` fails on a pathspec that matches neither, which happens
+        when an operation is rolled back before anything was staged. Both
+        commands below are used with `-z` so that paths are reported
+        verbatim, without the quoting `core.quotePath` applies to non-ASCII
+        page names.
+        """
+        paths = [p for p in paths if p]
+        if not paths:
+            return set()
+        known = set()
+        # paths currently in the index
+        known.update(self.repo.git.ls_files("-z", "--", *paths).split("\0"))
+        # paths present in the revision. A staged rename drops the old path
+        # from the index, so the index alone is not enough.
+        known.update(
+            self.repo.git.ls_tree(
+                "-r", "-z", "--name-only", revision, "--", *paths
+            ).split("\0")
+        )
+        return {p for p in known if p}
+
+    def restore(self, paths, revision="HEAD"):
+        """Discard staged and working-tree changes below `paths`, restoring
+        them to `revision` (HEAD by default). Used to roll back a partially
+        applied, uncommitted operation so the repository is never left with
+        dangling changes.
+
+        Only the given paths are touched: uncommitted changes elsewhere in
+        the repository - a concurrent pull, for instance - are left alone.
+        """
+        self._validate_revision(revision)
+        known = self._known_paths(paths, revision)
+        if not known:
+            return
+        try:
+            self.repo.git.restore(
+                "--source",
+                revision,
+                "--staged",
+                "--worktree",
+                "--",
+                *sorted(known),
+            )
+        except git.exc.GitCommandError as e:
+            raise StorageError(
+                "Restoring {} to {} failed: {}.".format(
+                    ", ".join(sorted(known)), revision, e
+                )
+            )
+
     def revert(self, revision, message="", author=("", "")):
+        self._validate_revision(revision)
         actor = git.Actor(author[0], author[1])
         try:
             self.repo.git.revert(revision, "--no-commit")
@@ -333,10 +489,20 @@ class GitStorage(object):
             raise StorageError("Revert failed.")
 
         actor = git.Actor(author[0], author[1])
-        self.repo.index.commit(message, author=actor)
+        commit = self.repo.index.commit(message, author=actor)
+
+        changed_files = list(commit.stats.files.keys())
+        plugin_manager.hook.repository_changed(changed_files=changed_files)
+
+        # auto-push after revert
+        repo_manager = get_repo_manager()
+        if repo_manager:
+            repo_manager.auto_push_if_enabled()
 
     def diff(self, rev_a, rev_b):
         # https://docs.python.org/2/library/difflib.html
+        self._validate_revision(rev_a)
+        self._validate_revision(rev_b)
         return self.repo.git.diff(rev_a, rev_b)
 
     def delete(self, filename, message=None, author=("", "")):
@@ -367,6 +533,13 @@ class GitStorage(object):
             message = "Deleted {}.".format(filename_remove)
         self.repo.index.commit(message, author=actor)
 
+        plugin_manager.hook.repository_changed(changed_files=filename_remove)
+
+        # auto-push after delete
+        repo_manager = get_repo_manager()
+        if repo_manager:
+            repo_manager.auto_push_if_enabled()
+
     def rename(
         self,
         old_filename,
@@ -374,6 +547,7 @@ class GitStorage(object):
         message=None,
         author=None,
         no_commit=False,
+        files_updated=None,
     ):
         if self.exists(new_filename):
             raise StorageError(
@@ -396,7 +570,8 @@ class GitStorage(object):
         if message is None:
             message = "{} renamed to {}.".format(old_filename, new_filename)
         if not no_commit:
-            self.commit([new_filename], message, author, no_add=True)
+            files_updated = (files_updated or []) + [new_filename]
+            self.commit(files_updated, message, author, no_add=True)
 
     def list(self, p=None, depth=None, exclude=[]):
         excludes = [".git"] + exclude
@@ -437,6 +612,7 @@ class GitStorage(object):
         return sorted(result_files), sorted(result_directories)
 
     def show_commit(self, revision):
+        self._validate_revision(revision)
         try:
             commit = self.repo.commit(revision)
         except git.exc.BadName as e:
@@ -459,6 +635,47 @@ class GitStorage(object):
                 except IndexError:
                     raise StorageNotFound
         raise StorageNotFound
+
+    def get_filename_at_revision(self, current_filename, revision):
+        """
+        Get the filename that was used at a specific revision.
+        """
+        try:
+            # get the full log with --follow to understand the rename chain
+            full_log = self.repo.git.log(
+                "--follow",
+                "--name-only",
+                "-z",
+                "--format=format:%H",
+                "--",
+                current_filename,
+            )
+
+            if not full_log.strip():
+                return current_filename
+
+            entries = [
+                entry
+                for entry in full_log.strip('\x00').split('\x00\x00')
+                if entry
+            ]
+
+            for entry in entries:
+                # format: "commit_hash\nfilename"
+                lines = entry.strip('\x00').split('\n')
+                if len(lines) >= 2:
+                    entry_revision = lines[0]
+                    entry_filename = lines[1]
+
+                    if entry_revision.startswith(
+                        revision
+                    ) or revision.startswith(entry_revision[:6]):
+                        return entry_filename
+
+            return current_filename
+
+        except git.exc.GitCommandError as e:
+            return current_filename
 
 
 storage = None

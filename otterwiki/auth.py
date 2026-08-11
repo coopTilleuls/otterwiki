@@ -2,8 +2,8 @@
 # vim: set et ts=8 sts=4 sw=4 ai:
 
 import hmac
+import re
 from datetime import datetime
-from urllib.parse import urlsplit
 from uuid import uuid4
 import os
 
@@ -39,8 +39,10 @@ from otterwiki.util import random_password, empty
 
 
 def check_password_hash_backport(pwhash, password):
-    if pwhash is None or len(pwhash.strip()) < 0:
-        app.logger.warning(f"")
+    if not pwhash or not pwhash.strip():
+        app.logger.warning(
+            "check_password_hash_backport called with empty or None pwhash"
+        )
         return False
     # split pwhash to check the method
     triplet = pwhash.split("$", 2)
@@ -99,7 +101,14 @@ class SimpleAuth:
             return ("Anonymous", "")
         return (current_user.name, current_user.email)
 
-    def login_form(self, email, remember=None, next=None):
+    def login_form(
+        self,
+        email,
+        remember=None,
+        next=None,
+        message=None,
+        confirmation_url=None,
+    ):
         if next is None:
             next = request.args.get("next")
         # render template
@@ -108,6 +117,8 @@ class SimpleAuth:
             title="Login",
             email=email,
             remember=remember,
+            message=message,
+            confirmation_url=confirmation_url,
             next=next,
         )
 
@@ -143,14 +154,14 @@ class SimpleAuth:
                 and not user.is_admin
                 and not user.email_confirmed
             ):
-                toast(
-                    "Please confirm your email address. "
-                    + "<a href='{}'>Resend confirmation link.</a>".format(
-                        url_for("request_confirmation_link", email=email)
+                return self.login_form(
+                    email=email,
+                    remember=remember,
+                    message="Your email address has not been confirmed.",
+                    confirmation_url=url_for(
+                        "request_confirmation_link", email=email
                     ),
-                    "warning",
                 )
-                return redirect(url_for("login"))
             if not user.is_admin and (
                 self._user_needs_approvement() and not user.is_approved
             ):
@@ -159,7 +170,22 @@ class SimpleAuth:
             # login
             login_user(user, remember=remember is not None)
             # set next_page
-            if not next_page or urlsplit(next_page).netloc != "":
+            if next_page:
+                # strip control characters that browsers may ignore but that
+                # can be used to bypass open-redirect checks (e.g. /\t//evil.com)
+                next_page = re.sub(r"[\t\n\r]", "", next_page)
+            # only allow redirects to a local path; reject anything that is not
+            # a single-slash relative path to prevent open redirects. keep
+            # next_page relative so the redirect targets the host the request
+            # was made to, even behind a reverse proxy or on a non-standard
+            # port. reject protocol-relative ("//evil.com") and absolute
+            # ("http://evil.com") urls, as well as backslash variants
+            # ("/\evil.com") that browsers normalise to "//evil.com"
+            if (
+                not next_page
+                or not next_page.startswith('/')
+                or next_page[1:2] in ('/', '\\')
+            ):
                 next_page = url_for("index")
             # check if the users password_hash is going to be deprecated
             if user.password_hash.startswith("sha256$"):
@@ -167,7 +193,7 @@ class SimpleAuth:
                     f"User has deprecated password hash: {user.email}"
                 )
                 toast(
-                    f"Please <a href='{url_for('settings')}'>update your password</a>. The hashing method used is deprecated. Check <a href='{url_for('settings')}'>settings</a> for additional information.",
+                    "Please update your password in Settings. The hashing method used is deprecated.",
                     "warning",
                 )
             else:
@@ -238,14 +264,30 @@ class SimpleAuth:
         # hash password
         hashed_password = generate_password_hash(password, method="scrypt")
         # handle flags
-        # first user is admin
-        if len(self.User.query.all()) < 1:
+        is_admin = False
+        # handle auto approval
+        is_approved = app.config["AUTO_APPROVAL"] is True
+        # check if user registered with ADMIN_USER_EMAIL
+        if not empty(app.config["ADMIN_USER_EMAIL"]):
+            if (
+                len(self.User.query.filter_by(is_admin=True).all()) < 1
+                and email == app.config["ADMIN_USER_EMAIL"]
+            ):
+                # user is expected to be admin
+                is_admin = True
+                is_approved = True
+
+            if (
+                len(self.User.query.filter_by(is_admin=True).all()) > 0
+                and email == app.config["ADMIN_USER_EMAIL"]
+            ):
+                app.logger.warning(
+                    f"Admin registration with {email}==ADMIN_USER_EMAIL skipped: Existing admin account(s) found."
+                )
+        # if not limit is set by ADMIN_USER_EMAIL first user is admin
+        elif len(self.User.query.all()) < 1:
             is_admin = True
             is_approved = True
-        else:
-            is_admin = False
-            # handle auto approval
-            is_approved = app.config["AUTO_APPROVAL"] is True
         # create user object
         user = self.User(  # pyright: ignore
             name=name,
@@ -423,10 +465,19 @@ class SimpleAuth:
         if not is_valid_email(email):
             toast("This email address is invalid.", "error")
         elif user is None:
-            toast("This email address is unknown.", "error")
+            # do not leak whether email is registered
+            toast(
+                "If this email is registered, you will receive a password reset link."
+            )
         else:
             # recovery process
-            token = serialize(email, salt="lost-password-email")
+            token = serialize(
+                {
+                    'email': email,
+                    'ls': user.last_seen.isoformat() if user.last_seen else '',
+                },
+                salt="lost-password-email",
+            )
             # generate mail
             subject = "Password Recovery - {} - An Otter Wiki".format(
                 app.config["SITE_NAME"]
@@ -443,15 +494,13 @@ class SimpleAuth:
             app.logger.info("auth: Password recovery for: {}".format(email))
             # notify user
             toast(
-                "A recovery link been sent to {}. Please check your mailbox.".format(
-                    email
-                )
+                "If this email is registered, you will receive a password reset link."
             )
         return self.lost_password_form()
 
     def handle_recover_password_token(self, token):
         try:
-            email = deserialize(
+            token_data = deserialize(
                 token, salt="lost-password-email", max_age=86400
             )
         except SerializeError:
@@ -459,11 +508,32 @@ class SimpleAuth:
                 "auth.recover_password_token() Invalid token: {}".format(token)
             )
             toast("Invalid token.", "error")
-            # redirect
             return redirect(url_for("login"))
+        # Support both old (plain string) and new (dict) token formats
+        if isinstance(token_data, str):
+            email = token_data
+            check_canary = False
+        else:
+            email = token_data['email']
+            check_canary = True
         user = self.User.query.filter_by(email=email).first()
         if user is not None:
-            login_user(user, remember=True)
+            # For new-format tokens: validate last_seen canary (single-use enforcement)
+            if check_canary:
+                expected_ls = (
+                    user.last_seen.isoformat() if user.last_seen else ''
+                )
+                if token_data.get('ls') != expected_ls:
+                    app.logger.warning(
+                        f"auth.recover_password_token() expired email={email} last_seen={token_data.get('ls')}"
+                    )
+                    toast("Token already used or expired.", "error")
+                    return redirect(url_for("login"))
+            # Invalidate the token by updating last_seen NOW (before login_user)
+            user.last_seen = datetime.now()
+            db.session.add(user)
+            db.session.commit()
+            login_user(user, remember=False)
             app.logger.info(
                 "auth: Password recovery successful: {}".format(email)
             )
@@ -471,7 +541,7 @@ class SimpleAuth:
             return redirect(url_for("settings"))
         else:
             toast("Invalid email address.")
-        return lost_password_form()
+        return self.lost_password_form()
 
     def has_permission(self, permission, user):
         if user.is_authenticated and user.is_admin:
@@ -557,18 +627,41 @@ class SimpleAuth:
 
 
 class ProxyHeaderAuth:
-    # if logout_link is not provided, hide the logout button
     def __init__(
         self,
-        logout_link=None,
-        username_header: str = 'x-otterwiki-name',
-        email_header: str = 'x-otterwiki-email',
-        permissions_header: str = 'x-otterwiki-permissions',
+        username_header: str,
+        email_header: str,
+        roles_header: str,
+        read_roles: str,
+        write_roles: str,
+        upload_roles: str,
+        admin_roles: str,
     ):
         self._username_header = username_header
         self._email_header = email_header
-        self._permissions_header = permissions_header
-        self.logout_link = logout_link
+        self._roles_header = roles_header
+        self._role_map = {
+            'READ': self._parse_roles(read_roles),
+            'WRITE': self._parse_roles(write_roles),
+            'UPLOAD': self._parse_roles(upload_roles),
+            'ADMIN': self._parse_roles(admin_roles),
+        }
+
+    @staticmethod
+    def _parse_roles(roles_str):
+        return {
+            r.strip().upper()
+            for r in re.split(r'[,\s]+', roles_str)
+            if r.strip()
+        }
+
+    def _map_roles_to_permissions(self, header_roles):
+        header_roles = set(header_roles)
+        return {
+            permission
+            for permission, allowed_roles in self._role_map.items()
+            if header_roles & allowed_roles
+        }
 
     class User(UserMixin):
         def __init__(self, name, email, permissions):
@@ -595,13 +688,11 @@ class ProxyHeaderAuth:
         if self._email_header not in req.headers:
             app.logger.error(f"Missing header: {self._email_header}")
             return None
-        if self._permissions_header in req.headers:
-            permissions = (
-                req.headers[self._permissions_header].upper().split(',')
-            )
+        if self._roles_header in req.headers:
+            roles = self._parse_roles(req.headers[self._roles_header])
         else:
-            app.logger.warning(f"Missing header: {self._permissions_header}")
-            permissions = []
+            app.logger.warning(f"Missing header: {self._roles_header}")
+            roles = set()
         name = req.headers.get(self._username_header, "")
         email = req.headers.get(self._email_header, "")
 
@@ -610,10 +701,14 @@ class ProxyHeaderAuth:
             return None
         elif empty(name):
             app.logger.warning(
-                f"name header '{self._username_header}' is emptyt"
+                f"name header '{self._username_header}' is empty"
             )
             # default to email as username if no username is set
             name = email
+
+        # resolve the roles from the roles header into the
+        # internal permission flags (READ/WRITE/UPLOAD/ADMIN)
+        permissions = self._map_roles_to_permissions(roles)
 
         return self.User(
             name=name,
@@ -769,7 +864,11 @@ elif app.config.get("AUTH_METHOD") == "PROXY_HEADER":
     auth_manager = ProxyHeaderAuth(
         username_header=app.config.get("AUTH_HEADERS_USERNAME"),
         email_header=app.config.get("AUTH_HEADERS_EMAIL"),
-        permissions_header=app.config.get("AUTH_HEADERS_PERMISSIONS"),
+        roles_header=app.config.get("AUTH_HEADERS_PERMISSIONS"),
+        read_roles=app.config.get("AUTH_ROLES_READ"),
+        write_roles=app.config.get("AUTH_ROLES_WRITE"),
+        upload_roles=app.config.get("AUTH_ROLES_UPLOAD"),
+        admin_roles=app.config.get("AUTH_ROLES_ADMIN"),
     )
 elif app.config.get("AUTH_METHOD") == "OAUTH2":
     auth_manager = OAuth2()

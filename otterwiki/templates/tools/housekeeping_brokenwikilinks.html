@@ -1,0 +1,87 @@
+<form hx-post="{{ url_for("housekeeping") }}" hx-target="this" hx-indicator="#brokenwikilinks_indicator" hx-headers='{"X-CSRFToken": "{{ csrf_token() }}"}'>
+<input type="hidden" name="task" value="brokenwikilinks">
+{% if stats and (pages or most_wanted) %}
+<div class="mb-20">
+<p> To keep your wiki clean, please review the broken WikiLinks found below.
+{{stats.pages}} page{{stats.pages|pluralize("s")}} were checked in {{stats.duration}}.
+</p>
+<input class="btn btn-primary" type="submit" name="refresh" value="Refresh"/>
+<span id="brokenwikilinks_indicator" class="htmx-indicator"><i class="fas fa-spinner fa-spin"></i></span>
+</div>
+
+{% if pages %}
+<p><strong>Pages with broken links</strong></p>
+<div class="table-responsive table-striped mb-20 subsection-table">
+<table class="table compact">
+    <thead>
+        <tr>
+            <td style="width:1px;"><strong>Page</strong></td>
+            <td><strong>Broken links</strong></td>
+            <td style="width:1px;text-align:right;"><strong>Quantity</strong></td>
+        </tr>
+    </thead>
+    <tbody>
+{% for pagename, broken_links in pages.items() %}
+        <tr>
+            <td style="white-space:nowrap;">
+                <a href="{{ url_for('view', path=pagename) }}" target="_blank">{{pagename}}</a>&nbsp;
+            </td>
+            <td style="white-space: normal; word-wrap: break-word;">
+                {% for link in broken_links %}
+                    <a href="{{ url_for('view', path=link) }}" target="_blank">{{link}}</a>{% if not loop.last %}, {% endif %}
+                {% endfor %}
+            </td>
+            <td style="width:1px;text-align:right;padding-right:.5rem;">
+                {{broken_links|length}}
+            </td>
+        </tr>
+{% endfor %}
+    </tbody>
+</table>
+</div>
+{% endif %}
+
+{% if most_wanted %}
+<p><strong>Most wanted pages</strong></p>
+<div class="table-responsive table-striped subsection-table">
+<table class="table compact">
+    <thead>
+        <tr>
+            <td style="width:1px;"><strong>Page</strong></td>
+            <td><strong>Found in</strong></td>
+            <td style="width:1px;text-align:right;"><strong>Occurrences</strong></td>
+        </tr>
+    </thead>
+    <tbody>
+{% for item in most_wanted %}
+        <tr>
+            <td style="white-space:nowrap;">
+                <a href="{{ url_for('view', path=item.page) }}" target="_blank">{{item.page}}</a>&nbsp;
+            </td>
+            <td style="white-space: normal; word-wrap: break-word;">
+                {% for page in item.found_in %}
+                    <a href="{{ url_for('view', path=page) }}" target="_blank">{{page}}</a>{% if not loop.last %}, {% endif %}
+                {% endfor %}
+            </td>
+            <td style="width:1px;text-align:right;padding-right:.5rem;">
+                {{item.occurrences}}
+            </td>
+        </tr>
+{% endfor %}
+    </tbody>
+</table>
+</div>
+{% endif %}
+
+{% else %}
+{% if stats %}
+<p>No broken WikiLinks found. Checked {{stats.pages}} page{{stats.pages|pluralize("s")}} in {{stats.duration}}.</p>
+{% else %}
+<p>To find pages with broken WikiLinks, start an analysis.</p>
+{% endif %}
+<div>
+    <input class="btn btn-primary" type="submit" name="refresh" value="Analyse pages"/>
+    <span id="brokenwikilinks_indicator" class="htmx-indicator"><i class="fas fa-spinner fa-spin"></i></span>
+</div>
+{% endif %}
+</form>

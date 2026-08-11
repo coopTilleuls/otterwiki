@@ -5,15 +5,19 @@ import datetime
 import mimetypes
 import os.path
 import pathlib
-import random
+import secrets
 import re
 import regex
 import string
 import time
 import unicodedata
+from hashlib import sha256
 from functools import lru_cache
 from typing import List, Tuple
 from unidiff import PatchSet
+
+# the cursor magic word which is ignored by the rendering
+cursormagicword = "CuRsoRm4g1cW0Rd"
 
 
 def ttl_lru_cache(ttl: int = 60, maxsize: int = 128):
@@ -45,10 +49,19 @@ def sizeof_fmt(num, suffix="B"):
 
 
 # from https://github.com/Python-Markdown/markdown/blob/master/markdown/extensions/toc.py
-def slugify(value, separator="-"):
+def slugify(value, separator="-", keep_slashes=False):
     """Slugify a string, to make it URL friendly."""
-    value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore")
-    value = re.sub(r"[^\w\s-]", "", value.decode("ascii")).strip().lower()
+    value = (
+        unicodedata.normalize("NFKD", value)
+        .encode("ascii", "ignore")
+        .decode("ascii")
+        .strip()
+        .lower()
+    )
+    if keep_slashes:
+        value = re.sub(r"[^\w\s\-/]", "", value)
+    else:
+        value = re.sub(r"[^\w\s\-]", "", value)
     return re.sub(r"[%s\s]+" % separator, separator, value)
 
 
@@ -76,7 +89,7 @@ def sanitize_pagename(value, allow_unicode=True, handle_md=False):
             .decode("ascii")
         )
     if handle_md:
-        value = re.sub(r".md$", "", value)
+        value = re.sub(r"\.md$", "", value)
     # remove slashes, question marks ...
     value = re.sub(r"[?|$|.|!|#|\\]", r"", value)
 
@@ -103,16 +116,27 @@ def split_path(path: str) -> List[str]:
 
 def titleSs(s):
     """
-    This function is a workaround for str.title() not knowing uppercase 'ß'.
+    This function is a workaround for str.title() not knowing uppercase 'ß'
+    and treating the apostrophe as a word boundary.
     """
-    if 'ß' not in s:
-        return s.title()
-    _magicword = 'M🙉A🙈G🙊I🐤C🐣W🐥O🦆R🐔D'
-    while _magicword in s:
-        _magicword = 2 * _magicword
-    s = s.replace('ß', _magicword)
+    _eszett = ''
+    if 'ß' in s:
+        _eszett = 'E🙉S🙈Z🙊E🐤T🐣T'
+        while _eszett in s:
+            _eszett = 2 * _eszett
+        s = s.replace('ß', _eszett)
+    _apostrophe = ''
+    if "'" in s:
+        _apostrophe = 'A🙉P🙈O🙊S🐤T🐣R🐥O🦆P🐔H🦜E'
+        while _apostrophe in s:
+            _apostrophe = 2 * _apostrophe
+        s = s.replace("'", _apostrophe)
     s = s.title()
-    return re.sub(re.escape(_magicword), 'ß', s, flags=re.IGNORECASE)
+    if _eszett:
+        s = re.sub(re.escape(_eszett), 'ß', s, flags=re.IGNORECASE)
+    if _apostrophe:
+        s = re.sub(re.escape(_apostrophe), "'", s, flags=re.IGNORECASE)
+    return s
 
 
 def get_pagepath(pagename):
@@ -139,9 +163,9 @@ def is_valid_email(email):
     return mail_regexp.fullmatch(email) is not None
 
 
-def random_password(len=8):
+def random_password(len=16):
     return "".join(
-        random.choice(string.ascii_lowercase + string.digits)
+        secrets.choice(string.ascii_lowercase + string.digits)
         for _ in range(len)
     )
 
@@ -420,3 +444,23 @@ def get_PatchSet(s: str) -> PatchSet:
         m = RE_DIFF_HEAD_WITH_QUOTED_FILENAMES.search(s)
 
     return PatchSet(s)
+
+
+def sha256sum(s: str) -> str:
+    hash = sha256()
+    hash.update(s.encode())
+    return hash.hexdigest()
+
+
+def compute_webhook_hash(secret_key: str, remote_url: str) -> str:
+    import hmac
+
+    return hmac.new(
+        secret_key.encode(),
+        remote_url.encode(),
+        sha256,
+    ).hexdigest()
+
+
+def compute_webhook_hash_legacy(remote_url: str) -> str:
+    return sha256((remote_url + 'otterwiki').encode()).hexdigest()

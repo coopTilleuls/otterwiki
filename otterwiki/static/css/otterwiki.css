@@ -7,8 +7,18 @@
 @import "partials/documentation.css";
 @import "partials/history.css";
 
+/* Native widgets (e.g. select popups) follow the page color scheme,
+ * which must be declared on the root element, not just on body. */
+:root:has(body.dark-mode) {
+    color-scheme: dark;
+}
+
 .navbar {
     background: #d2d2d2;
+}
+
+.content-wrapper:focus {
+    outline: none;
 }
 
 .navbar-content .dropdown button {
@@ -116,6 +126,7 @@ div.page > div.highlight {
 .page code,
 .page .code {
     min-height: 2.6rem;
+    white-space: pre;
 }
 
 code,
@@ -123,7 +134,7 @@ pre,
 .code {
     padding: 0.2rem;
     background-color: rgba(0, 0, 0, 0.05);
-    font-size: inherit;
+    font-size: 1.4rem;
     line-height: 1.5;
     padding: 0.1rem 0.5rem;
     margin: 0 0.1rem;
@@ -467,4 +478,115 @@ mark {
     line-height: 1.5rem;
     height: 2.2rem;
     width: 2.2rem;
+}
+
+.table-draft .copy-to-clipboard {
+    white-space: pre-wrap;
+}
+
+/* fix mobile scrollbars */
+@media (max-width: 768px) {
+    .with-custom-webkit-scrollbars *::-webkit-scrollbar {
+        width: 1.4rem !important;
+        height: 1.4rem !important;
+    }
+
+    .with-custom-webkit-scrollbars *::-webkit-scrollbar-track:vertical {
+        border-left: 1px solid rgba(0, 0, 0, 0.1) !important;
+    }
+
+    .with-custom-webkit-scrollbars *::-webkit-scrollbar-track:horizontal {
+        border-top: 1px solid rgba(0, 0, 0, 0.1) !important;
+    }
+
+    .with-custom-webkit-scrollbars *::-webkit-scrollbar-thumb {
+        background-color: rgba(0, 0, 0, 0.25) !important;
+        border-radius: 0.7rem !important;
+        border: 2px solid transparent !important;
+        background-clip: content-box !important;
+        min-height: 3rem !important;
+        min-width: 3rem !important;
+    }
+
+    .with-custom-webkit-scrollbars *::-webkit-scrollbar-thumb:hover {
+        background-color: rgba(0, 0, 0, 0.4) !important;
+    }
+
+    .with-custom-webkit-scrollbars *::-webkit-scrollbar-corner {
+        background-color: transparent !important;
+    }
+
+    .dark-mode.with-custom-webkit-scrollbars *::-webkit-scrollbar-track {
+        border-color: rgba(255, 255, 255, 0.05) !important;
+    }
+
+    .dark-mode.with-custom-webkit-scrollbars *::-webkit-scrollbar-thumb {
+        background-color: rgba(255, 255, 255, 0.25) !important;
+    }
+
+    .dark-mode.with-custom-webkit-scrollbars *::-webkit-scrollbar-thumb:hover {
+        background-color: rgba(255, 255, 255, 0.4) !important;
+    }
+
+    .dark-mode.with-custom-webkit-scrollbars .sidebar::-webkit-scrollbar,
+    .dark-mode.with-custom-webkit-scrollbars .modal-dialog::-webkit-scrollbar,
+    .dark-mode.with-custom-webkit-scrollbars .modal-full .modal-dialog::-webkit-scrollbar,
+    .dark-mode.with-custom-webkit-scrollbars .card::-webkit-scrollbar,
+    .dark-mode.with-custom-webkit-scrollbars .content-wrapper::-webkit-scrollbar,
+    .dark-mode.with-custom-webkit-scrollbars body::-webkit-scrollbar {
+        background-color: transparent !important;
+    }
+
+    /* ff */
+    .with-custom-css-scrollbars * {
+        scrollbar-width: thin !important;
+    }
+
+    .dark-mode.with-custom-css-scrollbars * {
+        scrollbar-color: rgba(255, 255, 255, 0.25) transparent !important;
+    }
+}
+
+.subsection-table {
+    padding-left: 1rem;
+}
+
+.form-control {
+    /* override halfmoon's form control font size to prevent mobile zoom */
+    font-size: 16px;
+}
+
+/* additional badge variants (halfmoon ships only primary/success/secondary/danger) */
+.badge.badge-warning {
+    color: var(--text-color-on-orange-color-bg);
+    background-color: var(--orange-color);
+    border-color: var(--orange-color);
+}
+.dark-mode .badge.badge-warning {
+    color: var(--text-color-on-orange-color-bg);
+    background-color: var(--orange-color);
+    border-color: var(--orange-color);
+}
+.badge.badge-notice {
+    color: #ffffff;
+    background-color: var(--gray-color-very-dark);
+    border-color: var(--gray-color-very-dark);
+}
+.dark-mode .badge.badge-notice {
+    color: rgba(0, 0, 0, 0.85);
+    background-color: var(--gray-color);
+    border-color: var(--gray-color);
+}
+
+.external::after {
+  content: "";
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-left: 4px;
+  background-color: currentColor;
+  mask: url("data:image/svg+xml;utf8,\
+  <svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2'><path d='M18 13v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6'/><polyline points='15 3 21 3 21 9'/><line x1='10' y1='14' x2='21' y2='3'/></svg>")
+        center / contain no-repeat;
+
 }

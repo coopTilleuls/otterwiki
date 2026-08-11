@@ -9,10 +9,33 @@ that will be expanded in the future.
 See docs/plugin_examples for examples.
 """
 
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from werkzeug.datastructures import MultiDict
+
 import pluggy
+
+import typing
+
+if typing.TYPE_CHECKING:
+    from otterwiki.sidebar import SidebarPageIndexEntry
 
 hookspec = pluggy.HookspecMarker("otterwiki")
 hookimpl = pluggy.HookimplMarker("otterwiki")
+
+
+@dataclass
+class EmbeddingArgs:
+    args: list[str] = field(default_factory=list)
+    options: dict[str, str] = field(default_factory=dict)
+    args_raw: list[str] = field(default_factory=list)
+    options_raw: dict[str, str] = field(default_factory=dict)
+
+    def get_flag(self, key: str, default: bool = False) -> bool:
+        try:
+            return self.options[key].lower() in ["true", "1", "on", "yes"]
+        except KeyError:
+            return default
 
 
 class OtterWikiPluginSpec:
@@ -23,6 +46,14 @@ class OtterWikiPluginSpec:
         """
         This hook receives the core objects and is to be used to
         initialize the plugin with the app, database, and storage.
+
+        Args:
+            app: The Flask application instance
+            db: The SQLAlchemy database instance
+            storage: The GitStorage instance for repository operations
+
+        Returns:
+            None
         """
         self.app = app
         self.db = db
@@ -34,21 +65,350 @@ class OtterWikiPluginSpec:
         This hook receives a markdown string, and can transform it any way it
         sees fit. It is called before the markdown is rendered into HTML.
 
-        If multiple hooks exits, they will be chained, the output of
+        If multiple hooks exist, they will be chained, the output of
         each hook will be fed into the next one.
+
+        Args:
+            md: The raw markdown string to be processed
+
+        Returns:
+            The transformed markdown string
         """
 
     @hookspec
     def renderer_html_postprocess(self, html: str) -> str | None:
         """
-        This hooks receive a html string. It is called after the pages
-        markdown has been rendered into html.
+        This hook receives an HTML string. It is called after the page's
+        markdown has been rendered into HTML.
+
+        Args:
+            html: The rendered HTML string to be processed
+
+        Returns:
+            The transformed HTML string
+        """
+
+    @hookspec
+    def renderer_javascript(self) -> str | None:
+        """
+        Reurns:
+            javascript code added to the rendered page
         """
 
     @hookspec
     def page_view_htmlcontent_postprocess(self, html, page) -> str | None:
         """
-        This hooks receives a html string containing the page content.
+        This hook receives the rendered HTML content of a page after markdown
+        processing but before final display.
+
+        Args:
+            html: The rendered HTML content of the page
+            page: The Page object representing the current page being viewed
+
+        Returns:
+            The transformed HTML content
+        """
+
+    @hookspec
+    def page_render_context(self, page, preview: bool) -> None:
+        """
+        This hooks recevied the context of the page currently being rendered.
+
+        Args:
+            page: The otterwiki.wiki.Page object
+            preview: bool True if page is previewed
+        """
+
+    @hookspec
+    def embedding_parse(
+        self, embedding, embedding_options={}, embedding_args=[]
+    ):
+        """
+        This hooks receives the name of the processed embedding and the args and returns
+        the html generated.
+        """
+
+    @hookspec
+    def embedding_render(self, embedding: str, args: EmbeddingArgs):
+        """
+        This hooks receives the name of the processed embedding and the args and returns
+        the html generated.
+        """
+
+    @hookspec
+    def template_html_head_inject(self, page) -> str | None:
+        """
+        This hook allows plugins to inject HTML content into the <head> section
+        of the page template. The content will be added after the default CSS/JS.
+
+        Args:
+            page: The current page path (optional, may be None)
+
+        Returns:
+            HTML string to inject into the <head> section, or None
+        """
+
+    @hookspec
+    def template_html_body_inject(self, page) -> str | None:
+        """
+        This hook allows plugins to inject HTML content at the end of the <body>
+        section of the page template, before the closing </body> tag.
+
+        Args:
+            page: The current page path (optional, may be None)
+
+        Returns:
+            HTML string to inject before the closing </body> tag, or None
+        """
+
+    @hookspec
+    def template_html_sidebar_left_inject(self, page) -> str | None:
+        """
+        This hook allows plugins to inject HTML content into the left sidebar
+        (where the menu and optional page index are). The content will be appended
+        to the existing sidebar content.
+
+        Args:
+            page: The current page path (optional, may be None)
+
+        Returns:
+            HTML string to inject to the left sidebar, or None
+        """
+
+    @hookspec
+    def template_html_sidebar_right_inject(self, page) -> str | None:
+        """
+        This hook allows plugins to inject HTML content into the right sidebar
+        (where the "On this page" block is). The content will be appended to the
+        existing sidebar content.
+
+        Args:
+            page: The current page path (optional, may be None)
+
+        Returns:
+            HTML string to inject to the right sidebar, or None
+        """
+
+    @hookspec
+    def renderer_process_link(
+        self, link_html, link_url, link_text, link_title, page
+    ) -> str | None:
+        """
+        This hook allows plugins to process and modify individual links during rendering.
+        It's called for each link as it's being rendered from markdown.
+
+        Args:
+            link_html: The complete HTML string for the link (e.g., '<a href="...">text</a>')
+            link_url: The URL/href attribute of the link
+            link_text: The display text of the link
+            link_title: The title attribute of the link (optional, may be None)
+            page: The current page path (optional, may be None)
+
+        Returns:
+            The modified link HTML string
+        """
+
+    @hookspec
+    def renderer_process_image(
+        self, image_html, image_src, image_alt, image_title, page
+    ) -> str | None:
+        """
+        This hook allows plugins to process and modify individual images during rendering.
+        It's called for each image as it's being rendered from markdown.
+
+        Args:
+            image_html: The complete HTML string for the image (e.g., '<img src="..." alt="...">')
+            image_src: The src attribute of the image
+            image_alt: The alt text of the image
+            image_title: The title attribute of the image (optional, may be None)
+            page: The current page path (optional, may be None)
+
+        Returns:
+            The modified image HTML string
+        """
+
+    @hookspec
+    def renderer_process_heading(
+        self,
+        heading_html,
+        heading_text,
+        heading_level,
+        heading_anchor,
+        page,
+    ) -> str | None:
+        """
+        This hook allows plugins to process and modify individual headings during rendering.
+        It's called for each heading as it's being rendered from markdown.
+
+        Args:
+            heading_html: The complete HTML string for the heading (e.g., '<h2 id="...">...</h2>')
+            heading_text: The text content of the heading (may include HTML tags)
+            heading_level: The heading level as an integer (1-6, corresponding to h1-h6)
+            heading_anchor: The anchor/id attribute generated for the heading
+            page: The current page path (optional, may be None)
+
+        Returns:
+            The modified heading HTML string
+        """
+
+    @hookspec
+    def renderer_process_wikilink(
+        self, wikilink_html, wikilink_url, wikilink_text, page
+    ) -> str | None:
+        """
+        This hook allows plugins to process and modify individual wikilinks during rendering.
+        It's called for each wikilink as it's being rendered from markdown.
+        WikiLinks are defined in the format [[Page Name]] or [[Page Name|Display Text]].
+
+        Args:
+            wikilink_html: The complete HTML string for the wikilink (e.g., '<a href="...">text</a>')
+            wikilink_url: The URL/href attribute of the wikilink
+            wikilink_text: The display text of the wikilink
+            page: The current page path (optional, may be None)
+
+        Returns:
+            The modified wikilink HTML string
+        """
+
+    @hookspec
+    def repository_changed(self, changed_files: list) -> None:
+        """
+        This hook is triggered when the repository changes, including page/attachment
+        creation, edit, or deletion. This also includes changes via the git web server
+        or automatic pulls.
+
+        Plugins cannot prevent the change, only read what was changed.
+
+        Args:
+            changed_files: List of file paths that were changed in the repository
+
+        Returns:
+            None
+        """
+
+    @hookspec
+    def page_saved(self, pagepath, content, author, message) -> None:
+        """
+        Called after a page has been saved and the content has changed.
+        """
+
+    @hookspec
+    def page_deleted(self, pagepath, author, message) -> None:
+        """
+        Called after a page has been deleted.
+        """
+
+    @hookspec
+    def page_renamed(
+        self, old_pagepath, new_pagepath, author, message
+    ) -> None:
+        """
+        Called after a page has been renamed.
+        """
+
+    @hookspec
+    def info(
+        self,
+    ) -> tuple[str, str, str] | None:
+        """
+        This hook is called to retrieve information about the plugin.
+        The return value is supposed to be the name of the plugin, a
+        short descripton and the category of the plugin. For generating the
+        User help the plugins are grouped by category.
+        """
+
+    @hookspec
+    def help(self, plugin: str) -> tuple[str, str] | None:
+        """
+        This hook is called to generate the documentation (help) for the plugin
+        """
+
+    @hookspec
+    def static_css(self) -> str | None:
+        """
+        css required by the plugin. Will be added to all sites
+        via the template layout.html
+        """
+
+    @hookspec
+    def help_category_prelude(self, category) -> str | None:
+        """
+        This hook is called to get information about the category
+        the plugin belongs to.
+        """
+
+    @hookspec
+    def url_request(
+        self,
+        plugin: str,
+        extra: str,
+        method: str = "GET",
+        values: MultiDict = MultiDict(),
+    ) -> str | None:
+        """
+        This hook receives the requests to /-/plugin/<name>/<extra>
+        with POST/GET in the method and values combined the combination of
+        args (the key/values in the query string) and form (key/value pairs
+        from the body for a post request), preferring args if keys overlap
+        """
+
+    @hookspec
+    def url_admin_request(
+        self,
+        plugin: str,
+        extra: str,
+        method: str = "GET",
+        values: MultiDict = MultiDict(),
+    ) -> str | None:
+        """
+        This hook receives the requests to /-/admin/plugin/<name>/<extra>
+        with POST/GET in the method and values combined the combination of
+        args (the key/values in the query string) and form (key/value pairs
+        from the body for a post request), preferring args if keys overlap
+        """
+
+    @hookspec
+    def sidebar_page_index_filter_entries(
+        self,
+        sidebarPageIndexEntries: list[tuple[str, 'SidebarPageIndexEntry']],
+        mode: str,
+    ) -> None:
+        """
+        This hook allows plugins to filter sidebar page index entries.
+        Only root entries needs to be filtered as the hook is called for list
+        of children of every entry.
+
+        Plugins must mutate ``sidebarPageIndexEntries`` in-place (e.g.
+        ``sidebarPageIndexEntries[:] = filtered``) rather than returning a
+        new list.  Return values are ignored because the hookspec does not
+        use ``firstresult``; only in-place changes are visible to the
+        caller and to subsequent plugins.
+
+        Args:
+            sidebarPageIndexEntries: Tree roots of entries that will be shown
+            mode: filter/sort mode to use (constants from config)
+        """
+
+    @hookspec
+    def sidebar_page_index_sort_entries(
+        self,
+        sidebarPageIndexEntries: list[tuple[str, 'SidebarPageIndexEntry']],
+        mode: str,
+    ) -> None:
+        """
+        This hook allows plugins to order sidebar page index entries.
+        Only root entries needs to be sorted as the hook is called for list
+        of children of every entry.
+
+        Plugins must mutate ``sidebarPageIndexEntries`` in-place (e.g.
+        ``sidebarPageIndexEntries.sort(...)``) rather than returning a
+        new list.  Return values are ignored because the hookspec does not
+        use ``firstresult``; only in-place changes are visible to the
+        caller and to subsequent plugins.
+
+        Args:
+            sidebarPageIndexEntries: Tree roots of entries that will be shown
+            mode: filter/sort mode to use (constants from config)
         """
 
 
@@ -61,6 +421,28 @@ def chain_hooks(hook_name, value, *args, **kwargs):
         fn = getattr(impl, 'function')
         value = fn(value, *args, **kwargs)
     return value
+
+
+def call_hook(hook_name, *args, **kwargs):
+    for impl in getattr(plugin_manager.hook, hook_name).get_hookimpls():
+        fn = getattr(impl, 'function')
+        value = fn(*args, **kwargs)
+        if value is not None:
+            return value
+    return None
+
+
+def collect_hook(hook_name, *args, **kwargs):
+    result = []
+    try:
+        for impl in getattr(plugin_manager.hook, hook_name).get_hookimpls():
+            fn = getattr(impl, 'function')
+            value = fn(*args, **kwargs)
+            if value is not None:
+                result.append(value)
+    except AttributeError:
+        pass
+    return result
 
 
 # this plugin_manager is exported so the normal pluggy API can be used in

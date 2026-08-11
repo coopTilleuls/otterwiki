@@ -11,7 +11,6 @@ lightweight as utils.
 
 import os
 import re
-from hashlib import sha256
 import json
 from collections import namedtuple
 from otterwiki.server import app, mail, storage, Preferences, db, app_renderer
@@ -20,7 +19,15 @@ from flask import flash, url_for, session
 from threading import Thread
 from flask_mail import Message
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
-from otterwiki.util import split_path, join_path, clean_slashes, titleSs
+from otterwiki.util import (
+    split_path,
+    join_path,
+    clean_slashes,
+    titleSs,
+    ttl_lru_cache,
+    sha256sum,
+    get_header,
+)
 from otterwiki.models import Cache
 
 
@@ -206,7 +213,9 @@ def get_pagename(filepath, full=False, header=None):
     return "/".join(arr)
 
 
-def get_pagename_for_title(filepath, full=False, header=None):
+def get_pagename_for_title(
+    filepath: str, full: bool = False, header: str | None = None
+):
     '''this will derive the page name for display purposes (titles, breadcrumbs, etc.) with underscore replacement'''
     pagename = get_pagename(filepath, full=full, header=header)
 
@@ -226,14 +235,28 @@ def get_pagename_for_title(filepath, full=False, header=None):
 def get_pagename_prefixes(filter=[]):
     pagename_prefixes = []
 
+    def _on_disk(path):
+        return path if app.config["RETAIN_PAGE_NAME_CASE"] else path.lower()
+
     if "pagecrumbs" in session:
         for crumb in session["pagecrumbs"][::-1]:
             if len(crumb) == 0 or crumb.lower() == "home":
                 continue
             crumb_parent = join_path(split_path(crumb)[:-1])
-            if len(crumb_parent) > 0 and crumb_parent not in pagename_prefixes:
+            if (
+                len(crumb_parent) > 0
+                and crumb_parent not in pagename_prefixes
+                and storage.isdir(_on_disk(crumb_parent))
+            ):
                 pagename_prefixes.append(crumb_parent)
-            if crumb not in pagename_prefixes and crumb not in filter:
+            if (
+                crumb not in pagename_prefixes
+                and crumb not in filter
+                and (
+                    storage.isdir(_on_disk(crumb))
+                    or storage.exists(get_filename(crumb))
+                )
+            ):
                 pagename_prefixes.append(crumb)
             if len(pagename_prefixes) > 3:
                 break
@@ -247,12 +270,26 @@ def get_breadcrumbs(pagepath):
     pagepath = pagepath.rstrip("/")
     parents = []
     crumbs = []
+    # When RETAIN_PAGE_NAME_CASE is set the on-disk name is used as-is and
+    # the page header is irrelevant, so skip the extra storage reads.
+    resolve_header = not app.config["RETAIN_PAGE_NAME_CASE"]
     for e in split_path(pagepath):
         parents.append(e)
+        crumbpath = join_path(parents)
+        # Resolve the component's own first header so the breadcrumb uses
+        # the same capitalization as the page title/sidebar/index (#516).
+        header = None
+        if resolve_header:
+            try:
+                header = get_header(
+                    storage.load(get_filename(crumbpath), size=512)
+                )
+            except StorageError:
+                pass
         crumbs.append(
             (
-                get_pagename_for_title(e),
-                join_path(parents),
+                get_pagename_for_title(e, header=header),
+                crumbpath,
             )
         )
     return crumbs
@@ -310,12 +347,6 @@ def patchset2urlmap(patchset, rev_b, rev_a=None):
     return url_map
 
 
-def sha256sum(s: str) -> str:
-    hash = sha256()
-    hash.update(s.encode())
-    return hash.hexdigest()
-
-
 def update_ftoc_cache(filename, ftoc, mtime=None):
     if mtime is None:
         try:
@@ -358,9 +389,102 @@ def get_ftoc(filename, mtime=None):
                 pass
         except:
             pass
-    content = storage.load(filename)
+    try:
+        content = storage.load(filename)
+    except StorageError:
+        return []
     # parse file contents
-    _, ftoc = app_renderer.markdown(content)
+    _, ftoc, _ = app_renderer.markdown(content)
     update_ftoc_cache(filename, ftoc, mtime)
 
     return ftoc
+
+
+@ttl_lru_cache(ttl=300, maxsize=2)
+def load_custom_html(filename: str):
+    custom_files = os.path.join(
+        # respect the environment variable USE_STATIC_PATH if set, e.g. in a docker environment
+        os.getenv(
+            "USE_STATIC_PATH",
+            os.path.join(
+                app.root_path,
+                'static',
+            ),
+        ),
+        'custom',
+    )
+    custom_file_path = os.path.join(custom_files, filename)
+    try:
+        if os.path.exists(custom_file_path):
+            with open(custom_file_path, 'r', encoding='utf-8') as f:
+                return f.read()
+
+    except Exception as e:
+        app.logger.warning(
+            f"Failed to load custom HTML file {filename} from {custom_file_path}: {e}"
+        )
+    return ""
+
+
+def get_admin_emails():
+    """Get email addresses of all admin users."""
+    from otterwiki.auth import get_all_user
+
+    admin_emails = []
+    try:
+        all_users = get_all_user()
+        admin_emails = [
+            user.email for user in all_users if user.is_admin and user.email
+        ]
+    except Exception as e:
+        app.logger.error(f"Failed to get admin emails: {e}")
+
+    return admin_emails
+
+
+def send_repository_error_notification(
+    operation_type, error_message, remote_url
+):
+    """
+    Send email notification to all admins about repository operation errors.
+
+    :param operation_type: Type of operation (e.g., "Auto Push", "Auto Pull", "Webhook Pull")
+    :param error_message: The error message to include
+    :param remote_url: The remote URL that failed
+    """
+    try:
+        admin_emails = get_admin_emails()
+        if not admin_emails:
+            app.logger.warning(
+                "No admin emails found for repository error notification"
+            )
+            return
+
+        subject = f"OtterWiki Repository Error - {operation_type} Failed"
+
+        # Create email body
+        body_lines = [
+            f"A repository operation has failed in your OtterWiki instance.",
+            f"",
+            f"Operation: {operation_type}",
+            f"Remote URL: {remote_url}",
+            f"Error: {error_message}",
+            f"",
+            f"Please check your repository configuration and git output.",
+        ]
+
+        text_body = "\n".join(body_lines)
+
+        send_mail(
+            subject=subject,
+            recipients=admin_emails,
+            text_body=text_body,
+            _async=True,
+        )
+
+        app.logger.info(
+            f"Repository error notification sent to {len(admin_emails)} admin(s) for {operation_type}"
+        )
+
+    except Exception as e:
+        app.logger.error(f"Failed to send repository error notification: {e}")

@@ -34,4 +34,9 @@ for PLUGIN in /app-data/plugins/*/ /plugins/*/; do
     pip install -U . || echo "Error: Installation of plugin in $PLUGIN failed." >&2
 done
 
+# Get the absolute path of the static files from the environment variable
+export USE_STATIC_PATH=${STATIC_PATH:-'/app/otterwiki/static'}
+# Configure UWSGI via ENV
+export UWSGI_STATIC_MAP="/static=$USE_STATIC_PATH"
+
 exec "$@"

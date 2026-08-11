@@ -1,15 +1,27 @@
 {#- vim: set et ts=8 sts=4 sw=4 ai: -#}
+{%- if (library_requirements and library_requirements.requires_mathjax) or force_load_libraries %}
 <script src="{{ url_for("static", filename="js/polyfill.e6.min.js") }}"></script>
 <script id="MathJax-script" async src="{{ url_for("static", filename="mathjax/tex-chtml.js") }}"></script>
-<script src="{{ url_for("static", filename="js/mermaid@11.6.0.min.js") }}"></script>
+{%- endif %}
+{%- if (library_requirements and library_requirements.requires_mermaid) or force_load_libraries %}
+<script src="{{ url_for("static", filename="js/mermaid@11.14.0.min.js") }}"></script>
+
 <script type="text/javascript">
     document.addEventListener("DOMContentLoaded", function(event) {
         let theme = 'neutral';
         if (document.querySelector("body").classList.contains("dark-mode")) {
             theme = 'dark';
         }
+        mermaid.parseError = function(err, hash) {
+            console.error("Mermaid error:", err.message);
+        };
         mermaid.initialize({
             theme: theme,
         });
     });
 </script>
+{%- endif %}
+{%- if (library_requirements and library_requirements.requires_datatables) or force_load_libraries %}
+<script type="text/javascript" src="{{ url_for("static", filename="js/simple-datatables@10.2.0.min.js") }}"></script>
+{%- endif %}
+{{extra_js|safe}}

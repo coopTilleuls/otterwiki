@@ -13,10 +13,14 @@ VERSION_MAJOR := $(shell python3 -c "with open('otterwiki/version.py') as f: exe
 PLATFORM ?= "linux/arm64,linux/amd64,linux/arm/v7,linux/arm/v6"
 PLATFORM_QUICK ?= "linux/arm64,linux/amd64"
 HELM_VERSION := $(shell grep ^version helm/Chart.yaml | awk '{print $$2}')
+BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
+# sanitize the branch name into a valid docker tag (replace invalid chars with -)
+BRANCH_TAG := $(shell git rev-parse --abbrev-ref HEAD | sed 's/[^a-zA-Z0-9_.-]/-/g')
 
 all: run
 
-.PHONY: clean coverage run debug shell sdist docker-build docker-test
+.PHONY: clean coverage run debug cli shell sdist docker-build docker-test frontend
+ARGS ?=
 
 clean:
 	rm -rf venv *.egg-info dist *.log* otterwiki/__pycache__ tests/__pycache__
@@ -36,6 +40,9 @@ run: venv settings.cfg
 debug: venv settings.cfg
 	FLASK_ENV=development FLASK_DEBUG=True FLASK_APP=otterwiki.server OTTERWIKI_SETTINGS=../settings.cfg venv/bin/flask run --port $(PORT)
 
+cli: venv settings.cfg
+	FLASK_APP=otterwiki.server OTTERWIKI_SETTINGS=$(PWD)/settings.cfg venv/bin/flask $(ARGS)
+
 profiler: venv settings.cfg
 	FLASK_DEBUG=True FLASK_APP=otterwiki.server OTTERWIKI_SETTINGS=../settings.cfg \
 		venv/bin/python otterwiki/profiler.py
@@ -45,13 +52,13 @@ shell: venv
 	FLASK_DEBUG=True FLASK_APP=otterwiki.server OTTERWIKI_SETTINGS=../settings.cfg venv/bin/flask shell
 
 test: venv
-	OTTERWIKI_SETTINGS="" venv/bin/pytest tests
+	OTTERWIKI_SETTINGS="" venv/bin/pytest tests docs/plugin_examples/tests
 
 tox: venv
 	venv/bin/tox
 
 coverage: venv
-	OTTERWIKI_SETTINGS="" venv/bin/coverage run --source=otterwiki -m pytest tests
+	OTTERWIKI_SETTINGS="" venv/bin/coverage run --source=otterwiki -m pytest tests docs/plugin_examples/tests
 	venv/bin/coverage report
 	venv/bin/coverage html
 
@@ -68,22 +75,8 @@ settings.cfg:
 	@echo ""
 	@false
 
-tmp/codemirror-5.65.15:
-	mkdir -p tmp && \
-	cd tmp && \
-	test -f codemirror.zip || wget https://codemirror.net/5/codemirror.zip && \
-	unzip codemirror.zip
-
-otterwiki/static/js/cm-modes.min.js: Makefile tmp/codemirror-5.65.15
-	cat tmp/codemirror-5.65.15/addon/mode/simple.js > otterwiki/static/js/cm-modes.js
-	cat tmp/codemirror-5.65.15/mode/meta.js >> otterwiki/static/js/cm-modes.js
-	for MODE in shell clike xml python javascript markdown yaml php sql \
-		toml cmake perl http go rust dockerfile powershell properties \
-		stex nginx haskell lua jinja2 ruby; do \
-		cat tmp/codemirror-5.65.15/mode/$$MODE/$$MODE.js \
-			>> otterwiki/static/js/cm-modes.js; \
-	done
-	./venv/bin/python -m rjsmin -p < otterwiki/static/js/cm-modes.js > otterwiki/static/js/cm-modes.min.js
+frontend:
+	cd frontend && npm install --include=dev && node esbuild.config.mjs
 
 docker-test:
 	# make sure the image is rebuild
@@ -108,7 +101,7 @@ else
 endif
 
 docker-push-slim: test
-ifeq ($(strip $(shell git rev-parse --abbrev-ref HEAD)),main)
+ifeq ($(strip $(BRANCH)),main)
 # check if git is clean
 ifneq ($(strip $(shell git status --porcelain)),)
 	$(error Error: Uncommitted changes in found)
@@ -127,17 +120,17 @@ else
 	@echo ""
 	docker buildx build --platform $(PLATFORM_QUICK) \
 		-f docker/Dockerfile.slim \
-		-t redimp/otterwiki:dev-$(shell git rev-parse --abbrev-ref HEAD)-slim \
-		--build-arg GIT_TAG="$(shell git describe --long)_$(shell git rev-parse --abbrev-ref HEAD)" \
+		-t redimp/otterwiki:dev-$(BRANCH_TAG)-slim \
+		--build-arg GIT_TAG="$(shell git describe --long)_$(BRANCH)" \
 		--push .
 	@echo ""
-	@echo "-- Done dev-image: redimp/otterwiki:dev-$(shell git rev-parse --abbrev-ref HEAD)-slim"
+	@echo "-- Done dev-image: redimp/otterwiki:dev-$(BRANCH_TAG)-slim"
 	@echo ""
 endif
 
 docker-push: test
 # check if we are in the main branch (to avoid accidentally pushing a feature branch
-ifeq ($(strip $(shell git rev-parse --abbrev-ref HEAD)),main)
+ifeq ($(strip $(BRANCH)),main)
 # check if git is clean
 ifneq ($(strip $(shell git status --porcelain)),)
 	$(error Error: Uncommitted changes in found)
@@ -154,18 +147,18 @@ else
 	@echo "-- Building dev image"
 	@echo ""
 	docker buildx build --platform $(PLATFORM_QUICK) \
-		-t redimp/otterwiki:dev-$(shell git rev-parse --abbrev-ref HEAD) \
-		--build-arg GIT_TAG="$(shell git describe --long)_$(shell git rev-parse --abbrev-ref HEAD)" \
+		-t redimp/otterwiki:dev-$(BRANCH_TAG) \
+		--build-arg GIT_TAG="$(shell git describe --long)_$(BRANCH)" \
 		--push .
 	@echo ""
-	@echo "-- Done dev-image: redimp/otterwiki:dev-$(shell git rev-parse --abbrev-ref HEAD)"
+	@echo "-- Done dev-image: redimp/otterwiki:dev-$(BRANCH_TAG)"
 	@echo ""
 endif
 
 pypi: test
 	./venv/bin/python3 -m pip install --upgrade build twine
 	./venv/bin/python3 -m build
-	./venv/bin/python3 -m twine upload dist/*
+	./venv/bin/python3 -m twine upload -r pypi dist/*
 
 helm-build:
 	cd helm/ && helm lint ./

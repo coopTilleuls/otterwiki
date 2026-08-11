@@ -74,6 +74,18 @@ The Sidebar can be configured to display the Page Index in different modes.
 You can display pages and directories either alphabetical, or with directories first,
 or only the directories. Alternatively you choose to not display the Page Index at all.
 
+The <code>Page Index Focus</code> setting controls which pages
+and folders are shown alongside the current page:
+
+- <code>Focus on current subtree</code> (default): only the parents and siblings of
+  the current page are listed. Other folders are hidden until you navigate into
+  them.
+- <code>Always display all top folders and pages</code>: every top level folder
+  and page is listed, but folders stay folded unless they are on the path to the
+  current page.
+- <code>Always display all pages, unfolded</code>: the complete page tree is
+  listed and every folder is expanded.
+
 ### Content and Editing Preferences
 
 #### Commit Messages
@@ -83,7 +95,7 @@ setting. Setting this to `optional` will allow empty commit messages.
 
 #### Page case name
 An Otter Wiki stores pages in files with names of all lowercase names. To retain
-the upper and lower case of the filenames, check <span class="help-button"><input type="checkbox" style="display:inline;" id="true-retain-page-name" checked> Retain page name case</span>.
+the upper and lower case of the filenames, check <span class="help-button"><input type="checkbox" style="display:inline;" id="true-retain-page-name" checked>Retain page name case</span>.
 
 #### Git Web server
 With <span class="help-button"><input type="checkbox" style="display:inline;" id="true-git-webserver" checked> Enable Git Server</span> allow users with the permission to READ to clone and pull the wiki content via git and users with UPLOAD/Attachment management permissions to push content. HTTP Basic authentication is used for non anonymous access. There is no option for using git via ssh. When enabled, users find the URL to clone the repositroy in their settings.

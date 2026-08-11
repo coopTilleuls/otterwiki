@@ -1,15 +1,52 @@
 #!/usr/bin/env python
 # vim: set et ts=8 sts=4 sw=4 ai:
 
-import re
-import yaml
+"""
+This file contains plugins that extend the mistune Markdown renderer.
 
-from mistune.inline_parser import LINK_LABEL
-from mistune.util import unikey, ESCAPE_TEXT
+Specifically, it includes plugins for:
+
+- Alerts: Adds the ability to create highlighted alert messages.
+- Embeddings: Allows embedding external plugins providing functionality beyond markdown.
+- Fancy Blocks: Allows for creating visually distinct blocks with custom styles (e.g., info, warning).
+- Folding: Enables collapsing blocks of text.
+- Footnotes: Adds support for creating and displaying footnotes in Markdown.
+- Frontmatter: Parses and utilizes frontmatter information (e.g., title, metadata) at the beginning of a document.
+- Math: Supports rendering mathematical expressions using LaTeX syntax.
+- Spoilers: Provides functionality to hide content behind a button.
+- Task Lists: Enables the creation of to-do lists with checkboxes.
+- Wiki Links: Handles wiki links.
+"""
+
+import re
+import string
+import yaml
+import base64
+import mistune
+
+from mistune.helpers import LINK_LABEL
+from mistune.util import unikey
 import urllib.parse
-from otterwiki.util import slugify
+
+# ESCAPE_TEXT was removed from mistune.util in v3; reconstruct it locally
+ESCAPE_TEXT = r"\\" + r"[" + re.escape(string.punctuation) + r"]"
+from otterwiki.plugins import chain_hooks
+from otterwiki.util import slugify, cursormagicword
+from otterwiki.plugins import EmbeddingArgs, call_hook
+
+import otterwiki.renderer_embeddings  # pyright: ignore
 
 __all__ = ['plugin_task_lists', 'plugin_footnotes']
+
+
+def _rm(method):
+    """Wrap a plugin instance method for use with md.renderer.register().
+
+    md.renderer.register() calls the function as func(renderer, *args, **kwargs),
+    injecting the renderer as first positional argument. Plugin render methods
+    use 'self' (the plugin), not the renderer, so we need to drop that first arg.
+    """
+    return lambda _renderer, *args, **kwargs: method(*args, **kwargs)
 
 
 class mistunePluginFootnotes:
@@ -31,6 +68,7 @@ class mistunePluginFootnotes:
     #:
     #:    [^key]
     INLINE_FOOTNOTE_PATTERN = r'\[\^(' + LINK_LABEL + r')\]'
+    INLINE_FOOTNOTE_RE = re.compile(INLINE_FOOTNOTE_PATTERN)
 
     #: define a footnote item like::
     #:
@@ -62,26 +100,40 @@ class mistunePluginFootnotes:
         return outval
 
     def parse_inline_footnote(self, inline, m, state):
-        key = unikey(m.group(1))
-        def_footnotes = state.get('def_footnotes')
+        m2 = self.INLINE_FOOTNOTE_RE.match(m.group(0))
+        key = unikey(m2.group(1)) if m2 else None
+        def_footnotes = state.env.get('def_footnotes')
         if not def_footnotes or key not in def_footnotes:
-            return 'text', m.group(0)
+            state.append_token({'type': 'text', 'raw': m.group(0)})
+            return m.end()
 
-        index = state.get('footnote_index', 0)
+        index = state.env.get('footnote_index', 0)
         index += 1
-        state['footnote_index'] = index
-        state['footnotes'].append(key)
+        state.env['footnote_index'] = index
+        state.env.setdefault('footnotes', []).append(key)
         # footnote number
-        fn = list(state['def_footnotes'].keys()).index(key) + 1
-        return 'footnote_ref', key, fn, index
+        fn = list(state.env['def_footnotes'].keys()).index(key) + 1
+        state.append_token(
+            {
+                'type': 'footnote_ref',
+                'attrs': {'key': key, 'fn': fn, 'index': index},
+            }
+        )
+        return m.end()
 
     def parse_def_footnote(self, block, m, state):
-        key = unikey(m.group(2))
-        if key not in state['def_footnotes']:
-            state['def_footnotes'][key] = m.group(3)
+        m2 = self.DEF_FOOTNOTE.match(m.group(0))
+        if not m2:
+            return m.end()
+        key = unikey(m2.group(2))
+        if key not in state.env.get('def_footnotes', {}):
+            if 'def_footnotes' not in state.env:
+                state.env['def_footnotes'] = {}
+            state.env['def_footnotes'][key] = m2.group(3)
+        return m.end()
 
     def parse_footnote_item(self, block, k, refs, state):
-        def_footnotes = state['def_footnotes']
+        def_footnotes = state.env['def_footnotes']
         text = def_footnotes[k]
         idx = list(def_footnotes.keys()).index(k) + 1
         stripped_text = text.strip()
@@ -96,32 +148,35 @@ class mistunePluginFootnotes:
             spaces = len(second_line) - len(second_line.lstrip())
             pattern = re.compile(r'^ {' + str(spaces) + r',}', flags=re.M)
             text = pattern.sub('', text)
-            children = block.parse_text(text, state)
-            if not isinstance(children, list):
-                children = [children]
+            child = state.child_state(text)
+            block.parse(child)
+            children = child.tokens
 
         return {
             'type': 'footnote_item',
             'children': children,
-            'params': (k, idx, refs),
+            'attrs': {'key': k, 'kindex': idx, 'refs': refs},
         }
 
     def md_footnotes_hook(self, md, result, state):
-        footnotes = state.get('footnotes')
+        from mistune.core import BlockState as _BlockState
+
+        footnotes = state.env.get('footnotes')
         if not footnotes:
             return result
 
         children = []
-        for k in state.get('def_footnotes'):
+        for k in state.env.get('def_footnotes', {}):
             refs = [i + 1 for i, j in enumerate(footnotes) if j == k]
             children.append(self.parse_footnote_item(md.block, k, refs, state))
 
-        tokens = [{'type': 'footnotes', 'children': children}]
-        output = md.block.render(tokens, md.inline, state)
+        child_state = _BlockState(parent=state)
+        child_state.tokens = [{'type': 'footnotes', 'children': children}]
+        output = md.render_state(child_state)
         return result + output
 
-    def render_html_footnote_ref(self, key, index, fn):
-        return f'<sup class="footnote-ref" id="fnref-{fn}"><a href="#fn-{index}">{index}</a></sup>'
+    def render_html_footnote_ref(self, key, fn, index):
+        return f'<sup class="footnote-ref" id="fnref-{index}"><a href="#fn-{fn}">{fn}</a></sup>'
 
     def render_html_footnotes(self, text):
         return (
@@ -159,32 +214,28 @@ class mistunePluginFootnotes:
         return '<li id="fn-' + str(kindex) + '">' + text + '</li>\n'
 
     def __call__(self, md):
-        md.inline.register_rule(
+        md.inline.register(
             'footnote',
             self.INLINE_FOOTNOTE_PATTERN,
             self.parse_inline_footnote,
+            before='link',
         )
-        index = md.inline.rules.index('std_link')
-        if index != -1:
-            md.inline.rules.insert(index, 'footnote')
-        else:
-            md.inline.rules.append('footnote')
 
-        md.block.register_rule(
-            'def_footnote', self.DEF_FOOTNOTE, self.parse_def_footnote
+        md.block.register(
+            'def_footnote',
+            self.DEF_FOOTNOTE.pattern,
+            self.parse_def_footnote,
+            before='ref_link',
         )
-        index = md.block.rules.index('def_link')
-        if index != -1:
-            md.block.rules.insert(index, 'def_footnote')
-        else:
-            md.block.rules.append('def_footnote')
 
         if md.renderer.NAME == 'html':
-            md.renderer.register('footnote_ref', self.render_html_footnote_ref)
             md.renderer.register(
-                'footnote_item', self.render_html_footnote_item
+                'footnote_ref', _rm(self.render_html_footnote_ref)
             )
-            md.renderer.register('footnotes', self.render_html_footnotes)
+            md.renderer.register(
+                'footnote_item', _rm(self.render_html_footnote_item)
+            )
+            md.renderer.register('footnotes', _rm(self.render_html_footnotes))
 
         md.after_render_hooks.append(self.md_footnotes_hook)
 
@@ -196,18 +247,17 @@ class mistunePluginTaskLists:
 
     TASK_LIST_ITEM = re.compile(r'^(\[[ xX]\])\s+')
 
-    def task_lists_hook(self, md, tokens, state):
-        return self._rewrite_all_list_items(tokens)
+    def task_lists_hook(self, md, state):
+        self._rewrite_all_list_items(state.tokens)
 
-    def render_ast_task_list_item(self, children, level, checked):
+    def render_ast_task_list_item(self, children, checked):
         return {
             'type': 'task_list_item',
             'children': children,
-            'level': level,
             'checked': checked,
         }
 
-    def render_html_task_list_item(self, text, level, checked):
+    def render_html_task_list_item(self, text, checked=False):
         checkbox = '<input class="task-list-item-checkbox" ' 'type="checkbox" '
         if checked:
             checkbox += ' checked/>'
@@ -226,11 +276,11 @@ class mistunePluginTaskLists:
 
         if md.renderer.NAME == 'html':
             md.renderer.register(
-                'task_list_item', self.render_html_task_list_item
+                'task_list_item', _rm(self.render_html_task_list_item)
             )
         elif md.renderer.NAME == 'ast':
             md.renderer.register(
-                'task_list_item', self.render_ast_task_list_item
+                'task_list_item', _rm(self.render_ast_task_list_item)
             )
 
     def _rewrite_all_list_items(self, tokens):
@@ -239,7 +289,6 @@ class mistunePluginTaskLists:
                 self._rewrite_list_item(tok)
             if 'children' in tok.keys():
                 self._rewrite_all_list_items(tok['children'])
-        return tokens
 
     def _rewrite_list_item(self, item):
         children = item['children']
@@ -251,14 +300,9 @@ class mistunePluginTaskLists:
                 mark = m.group(1)
                 first_child['text'] = text[m.end() :]
 
-                params = item['params']
-                if mark == '[ ]':
-                    params = (params[0], False)
-                else:
-                    params = (params[0], True)
-
+                checked = mark != '[ ]'
                 item['type'] = 'task_list_item'
-                item['params'] = params
+                item['attrs'] = {'checked': checked}
 
 
 class mistunePluginMark:
@@ -266,25 +310,27 @@ class mistunePluginMark:
     MARK_PATTERN = (
         r'==(?=[^\s=])(' r'(?:\\=|[^=])*' r'(?:' + ESCAPE_TEXT + r'|[^\s=]))=='
     )
+    MARK_RE = None  # type: ignore[assignment] # compiled lazily in __call__
 
     def parse_mark(self, inline, m, state):
-        text = m.group(1)
-        return 'mark', inline.render(text, state)
+        m2 = self.MARK_RE.match(m.group(0))
+        new_state = state.copy()
+        new_state.src = m2.group(1) if m2 else m.group(0)[2:-2]
+        children = inline.render(new_state)
+        state.append_token({'type': 'mark', 'children': children})
+        return m.end()
 
     def render_html_mark(self, text):
         return '<mark>' + text + '</mark>'
 
     def __call__(self, md):
-        md.inline.register_rule('mark', self.MARK_PATTERN, self.parse_mark)
-
-        index = md.inline.rules.index('codespan')
-        if index != -1:
-            md.inline.rules.insert(index + 1, 'mark')
-        else:  # pragma: no cover
-            md.inline.rules.append('mark')
+        self.MARK_RE = re.compile(self.MARK_PATTERN)
+        md.inline.register(
+            'mark', self.MARK_PATTERN, self.parse_mark, before='emphasis'
+        )
 
         if md.renderer.NAME == 'html':
-            md.renderer.register('mark', self.render_html_mark)
+            md.renderer.register('mark', _rm(self.render_html_mark))
 
 
 class mistunePluginFancyBlocks:
@@ -299,8 +345,32 @@ class mistunePluginFancyBlocks:
         r'(?: {0,3}\2[~\:]* *\n+|$)'
     )
     FANCY_BLOCK_HEADER = re.compile(r'^#{1,5}\s*(.*)\n+')
+    # Scanner pattern without backreference (\2): when combined into the
+    # scanner regex, \2 refers to the wrong group and causes catastrophic
+    # backtracking. Replace with explicit alternation.
+    _FANCY_BLOCK_SCANNER_PATTERN = (
+        r'( {0,3})(\:{3,}|~{3,})([^\:\n]*)\n'
+        r'(?:|([\s\S]*?)\n)'
+        r'(?: {0,3}(?:\:{3,}|~{3,})[~\:]* *\n+|\Z)'
+    )
 
     def parse_fancy_block(self, block, m, state):
+        cursor = False
+        end_pos = (
+            m.end()
+        )  # save original scanner match end before re-assigning m
+        # check if the cursor was set inside the fancy block (in preview mode)
+        if cursormagicword in m.group(0):
+            cursor = True
+            m = self.FANCY_BLOCK.match(m.group(0).replace(cursormagicword, ""))
+            if not m:
+                return
+        else:
+            # Re-match with standalone regex so sub-groups are accessible
+            # (in the combined scanner, numbered groups are offset/None)
+            m = self.FANCY_BLOCK.match(m.group(0))
+            if not m:
+                return
         text = m.group(4) or ""
         family = m.group(3).strip().lower()
 
@@ -313,25 +383,31 @@ class mistunePluginFancyBlocks:
         # parse the text inside the block, remove headings from the rules
         # -- we don't want them in the toc so these are handled extra
         rules = list(block.rules)
-        rules.remove('axt_heading')
-        rules.remove('setex_heading')
+        for r in ('axt_heading', 'setex_heading'):
+            if r in rules:
+                rules.remove(r)
 
         # add a trailing newline, so that the children get rendered correctly
         if len(text) < 1 or text[-1] != "\n":
             text += "\n"
 
-        children = block.parse(text, state, rules)
-        if not isinstance(children, list):
-            children = [children]
+        child = state.child_state(text)
+        block.parse(child, rules)
 
-        return {
-            "type": "fancy_block",
-            "params": (family, header),
-            "text": text,
-            "children": children,
-        }
+        state.append_token(
+            {
+                "type": "fancy_block",
+                "attrs": {
+                    "family": family,
+                    "header": header,
+                    "cursor": cursor,
+                },
+                "children": child.tokens,
+            }
+        )
+        return end_pos
 
-    def render_html_fancy_block(self, text, family, header):
+    def render_html_fancy_block(self, text, family, header, cursor=False):
         if family in ["info", "blue"]:
             cls = "alert alert-primary"
         elif family in ["warning", "yellow"]:
@@ -342,31 +418,38 @@ class mistunePluginFancyBlocks:
             cls = "alert alert-success"
         elif family in ["none", "empty"]:
             cls = "alert"
+        elif family is not None:
+            cls = f"alert alert-{mistune.escape(family)}"
         else:
             cls = "alert"
         if header is not None:
-            header = f'<h4 class="alert-heading">{header}</h4>'
+            header = f'<h4 class="alert-heading">{mistune.escape(header)}</h4>'
         else:
             header = ""
         text = text.strip()
-        return (
+        output = (
             f'<div class="{cls} mb-20" role="alert">{header}\n{text}</div>\n'
         )
+        if cursor:
+            return cursormagicword + output
+        return output
 
     def __call__(self, md):
-        md.block.register_rule(
-            'fancy_block', self.FANCY_BLOCK, self.parse_fancy_block
+        md.block.register(
+            'fancy_block',
+            self._FANCY_BLOCK_SCANNER_PATTERN,
+            self.parse_fancy_block,
         )
 
-        md.block.rules.append('fancy_block')
-
         if md.renderer.NAME == "html":
-            md.renderer.register("fancy_block", self.render_html_fancy_block)
+            md.renderer.register(
+                "fancy_block", _rm(self.render_html_fancy_block)
+            )
 
 
 class mistunePluginSpoiler:
     SPOILER_LEADING = re.compile(r'^ *\>\!', flags=re.MULTILINE)
-    SPOILER_BLOCK = re.compile(r'(?: {0,3}>![^\n]*(\n|$))+')
+    SPOILER_BLOCK = re.compile(r'^(?: {0,3}>![^\n]*(\n|$))+', re.MULTILINE)
 
     def parse_spoiler_block(self, block, m, state):
         text = m.group(0)
@@ -375,44 +458,42 @@ class mistunePluginSpoiler:
         # the syntax >!
         text = self.SPOILER_LEADING.sub('', text)
 
-        children = block.parse(text, state)
-        if not isinstance(children, list):
-            children = [children]
+        child = state.child_state(text)
+        block.parse(child)
 
-        return {
-            "type": "spoiler_block",
-            "text": text,
-            "children": children,
-        }
+        state.append_token(
+            {
+                "type": "spoiler_block",
+                "children": child.tokens,
+            }
+        )
+        return m.end()
 
     def render_html_spoiler_block(self, text):
-        text = text.strip()
+        text = text.strip().replace('\n', ' ')
         if text.startswith('<p>'):
             text = text[3:]
         if text.endswith('</p>'):
             text = text[:-4]
-        return f'<div class="spoiler">\n  <button class="spoiler-button" onclick="otterwiki.toggle_spoiler(this)"><i class="far fa-eye"></i></button>\n  <p>{text}</p>\n</div>\n\n'
+        return f'<div class="spoiler">\n<button class="spoiler-button" onclick="otterwiki.toggle_spoiler(this)"><i class="far fa-eye"></i></button>\n<p>{text}</p>\n</div>\n'
 
     def __call__(self, md):
-        md.block.register_rule(
-            'spoiler_block', self.SPOILER_BLOCK, self.parse_spoiler_block
+        md.block.register(
+            'spoiler_block',
+            self.SPOILER_BLOCK.pattern,
+            self.parse_spoiler_block,
+            before='block_quote',
         )
-
-        index = md.block.rules.index('block_quote')
-        if index != -1:
-            md.block.rules.insert(index, 'spoiler_block')
-        else:
-            md.block.rules.append('spoiler_block')
 
         if md.renderer.NAME == "html":
             md.renderer.register(
-                "spoiler_block", self.render_html_spoiler_block
+                "spoiler_block", _rm(self.render_html_spoiler_block)
             )
 
 
 class mistunePluginFold:
     FOLD_LEADING = re.compile(r'^ *\>\|', flags=re.MULTILINE)
-    FOLD_BLOCK = re.compile(r'(?: {0,3}>\|[^\n]*(\n|$))+')
+    FOLD_BLOCK = re.compile(r'^(?: {0,3}>\|[^\n]*(\n|$))+', re.MULTILINE)
 
     FOLD_BLOCK_HEADER = re.compile(r'^#{1,5}\s*(.*)\n+')
 
@@ -433,16 +514,17 @@ class mistunePluginFold:
         if len(text) < 1 or text[-1] != "\n":
             text += "\n"
 
-        children = block.parse(text, state)
-        if not isinstance(children, list):
-            children = [children]
+        child = state.child_state(text)
+        block.parse(child)
 
-        return {
-            "type": "fold_block",
-            "text": text,
-            "children": children,
-            "params": (header,),
-        }
+        state.append_token(
+            {
+                "type": "fold_block",
+                "children": child.tokens,
+                "attrs": {"header": header},
+            }
+        )
+        return m.end()
 
     def render_html_fold_block(self, text, header=None):
         text = text.strip()
@@ -452,6 +534,7 @@ class mistunePluginFold:
             text = text[:-4]
         if header is None:
             header = "..."
+        header = mistune.escape(header)
         return f'''<details class="collapse-panel">
 <summary class="collapse-header">
 {header}
@@ -459,56 +542,123 @@ class mistunePluginFold:
 <div class="collapse-content"><p>{text}</p></div></details>'''
 
     def __call__(self, md):
-        md.block.register_rule(
-            'fold_block', self.FOLD_BLOCK, self.parse_fold_block
+        md.block.register(
+            'fold_block',
+            self.FOLD_BLOCK.pattern,
+            self.parse_fold_block,
+            before='block_quote',
         )
 
-        index = md.block.rules.index('block_quote')
-        if index != -1:
-            md.block.rules.insert(index, 'fold_block')
-        else:
-            md.block.rules.append('fold_block')
-
         if md.renderer.NAME == "html":
-            md.renderer.register("fold_block", self.render_html_fold_block)
+            md.renderer.register(
+                "fold_block", _rm(self.render_html_fold_block)
+            )
 
 
 class mistunePluginMath:
-    MATH_BLOCK = re.compile(r'(\${2})((?:\\.|.)*)\${2}')
+    MATH_BLOCK = re.compile(r'\s*(\${2})((?:\\.|.)*?)\${2}\s*', re.DOTALL)
+    # Scanner pattern anchored to line start (^ with re.M) so that $$
+    # inside backtick code spans mid-paragraph is not consumed as a
+    # block math token.  Uses non-greedy .*? so adjacent blocks stay
+    # separate, and inline (?s:...) for DOTALL since the block scanner
+    # compiles with re.M only.
+    _MATH_BLOCK_SCANNER_PATTERN = r'^\s*(\${2})((?s:(?:\\.|.)*?))\${2}\s*$'
     MATH_INLINE_PATTERN = (
         r'\$(?=[^\s\$])('
         r'(?:\\\$|[^\$])*'
         r'(?:' + ESCAPE_TEXT + r'|[^\s\$]))\$'
     )
+    # Inline display math: $$...$$ appearing in inline context (e.g.
+    # inside list items) where the block scanner cannot reach.
+    MATH_DISPLAY_INLINE_PATTERN = r'\$\$((?:\\\$|[^\$])+)\$\$'
+    MATH_DISPLAY_INLINE_RE = None  # type: ignore[assignment] # compiled lazily
+    MATH_INLINE_RE = None  # type: ignore[assignment] # compiled lazily in __call__
 
     def parse_block(self, block, m, state):
-        text = m.group(2)
-        return {
-            "type": "math_block",
-            "text": text,
-        }
+        m2 = self.MATH_BLOCK.match(m.group(0))
+        text = m2.group(2) if m2 else ""
+        state.append_token(
+            {
+                "type": "math_block",
+                "raw": text,
+            }
+        )
+        return m.end()
 
-    def render_html_block(self, text):
+    def _mark_required(self, md_renderer):
+        # Mark mathjax as required on the OtterwikiRenderer wrapper, which
+        # OtterwikiMdRenderer exposes as `.renderer`.
+        parent = getattr(md_renderer, 'renderer', None)
+        if parent is not None:
+            parent.requires_mathjax = True
+
+    def render_html_block(self, md_renderer, text):
+        self._mark_required(md_renderer)
+        text = mistune.escape(text, quote=False)
         return f'''\n\\[{text}\\]\n'''
 
     def parse_inline(self, inline, m, state):
-        text = m.group(1)
-        return 'math_inline', text
+        m2 = (
+            self.MATH_INLINE_RE.match(m.group(0))
+            if self.MATH_INLINE_RE
+            else None
+        )
+        text = m2.group(1) if m2 else m.group(0)[1:-1]
+        state.append_token({'type': 'math_inline', 'raw': text})
+        return m.end()
 
-    def render_html_inline(self, text):
+    def render_html_inline(self, md_renderer, text):
+        self._mark_required(md_renderer)
+        text = mistune.escape(text, quote=False)
         return '\\(' + text + '\\)'
 
+    def parse_display_inline(self, inline, m, state):
+        m2 = (
+            self.MATH_DISPLAY_INLINE_RE.match(m.group(0))
+            if self.MATH_DISPLAY_INLINE_RE
+            else None
+        )
+        text = m2.group(1) if m2 else m.group(0)[2:-2]
+        state.append_token(
+            {
+                'type': 'math_display_inline',
+                'raw': text,
+            }
+        )
+        return m.end()
+
+    def render_html_display_inline(self, md_renderer, text):
+        self._mark_required(md_renderer)
+        text = mistune.escape(text, quote=False)
+        return '\\[' + text + '\\]'
+
     def __call__(self, md):
-        md.block.register_rule('math_block', self.MATH_BLOCK, self.parse_block)
-        md.inline.register_rule(
+        self.MATH_DISPLAY_INLINE_RE = re.compile(
+            self.MATH_DISPLAY_INLINE_PATTERN
+        )
+        self.MATH_INLINE_RE = re.compile(self.MATH_INLINE_PATTERN)
+        md.block.register(
+            'math_block', self._MATH_BLOCK_SCANNER_PATTERN, self.parse_block
+        )
+        # Register display math ($$...$$) before single-$ inline math
+        # so that $$ is matched first in the inline alternation.
+        md.inline.register(
+            'math_display_inline',
+            self.MATH_DISPLAY_INLINE_PATTERN,
+            self.parse_display_inline,
+        )
+        md.inline.register(
             'math_inline', self.MATH_INLINE_PATTERN, self.parse_inline
         )
 
-        md.block.rules.append('math_block')
-        md.inline.rules.append('math_inline')
-
         if md.renderer.NAME == "html":
+            # Render methods receive the renderer as their first arg so they
+            # can mark MathJax as required on the OtterwikiRenderer wrapper.
             md.renderer.register("math_block", self.render_html_block)
+            md.renderer.register(
+                'math_display_inline',
+                self.render_html_display_inline,
+            )
             md.renderer.register('math_inline', self.render_html_inline)
 
 
@@ -522,7 +672,8 @@ class mistunePluginAlerts:
     }
     TYPES_WITH_PIPES = "|".join(TYPE_ICONS.keys())
     ALERT_LEADING = re.compile(
-        r'^ *\>(\s*\[!(' + TYPES_WITH_PIPES + r')\])?', flags=re.MULTILINE
+        r'^ *\>(\s*\[!(' + TYPES_WITH_PIPES + r')\])?',
+        flags=re.MULTILINE + re.I,
     )
     ALERT_BLOCK = re.compile(
         r'(?: {0,3}>\s*\[!('
@@ -530,43 +681,52 @@ class mistunePluginAlerts:
         + r')\][^\n]*(?:\n|$))( {0,3}>[^\n]*(?:\n|$))+',
         flags=re.I,
     )
+    # Pattern for scanner registration: uses (?i:...) inline flag (no global re.I)
+    # ^ anchor (with re.M) ensures the pattern only matches at line boundaries,
+    # preventing mid-line matches inside HTML like <code>>[!NOTE]\n> body</code>
+    _ALERT_BLOCK_SCANNER_PATTERN = (
+        r'^(?: {0,3}>\s*\[!(?i:'
+        + TYPES_WITH_PIPES
+        + r')\][^\n]*(?:\n|$))(?P<_alert_rest> {0,3}>[^\n]*(?:\n|$))+'
+    )
 
     def parse_alert_block(self, block, m, state):
         text = m.group(0)
-        type = m.group(1).upper()
+        m2 = self.ALERT_BLOCK.match(text)
+        type = (m2.group(1) if m2 else "NOTE").upper()
 
         # we are searching for the complete bock, so we have to remove
         # syntax from the beginning of each line>
         text = self.ALERT_LEADING.sub('', text)
 
-        children = block.parse(text, state)
-        if not isinstance(children, list):
-            children = [children]
+        child = state.child_state(text)
+        block.parse(child)
 
-        return {
-            "type": "alert_block",
-            "text": text,
-            "params": (type,),
-            "children": children,
-        }
+        state.append_token(
+            {
+                "type": "alert_block",
+                "children": child.tokens,
+                "attrs": {"type": type},
+            }
+        )
+        return m.end()
 
     def render_html_alert_block(self, text, type):
         text = text.strip()
-        return f'<div class="quote-alert quote-alert-{type.lower()}"><div class="quote-alert-header">{self.TYPE_ICONS[type]} {type.capitalize()}</div><p>{text}</p></div>\n'
+        return f'<div class="quote-alert quote-alert-{type.lower()}"><div class="quote-alert-header">{self.TYPE_ICONS[type]} {type.capitalize()}</div>{text}</div>\n'
 
     def __call__(self, md):
-        md.block.register_rule(
-            'alert_block', self.ALERT_BLOCK, self.parse_alert_block
+        md.block.register(
+            'alert_block',
+            self._ALERT_BLOCK_SCANNER_PATTERN,
+            self.parse_alert_block,
+            before='block_quote',
         )
 
-        index = md.block.rules.index('block_quote')
-        if index != -1:
-            md.block.rules.insert(index, 'alert_block')
-        else:
-            md.block.rules.append('alert_block')
-
         if md.renderer.NAME == "html":
-            md.renderer.register("alert_block", self.render_html_alert_block)
+            md.renderer.register(
+                "alert_block", _rm(self.render_html_alert_block)
+            )
 
 
 class mistunePluginWikiLink:
@@ -585,11 +745,20 @@ class mistunePluginWikiLink:
     )
     WIKI_LINK_MOD_RE = re.compile(WIKI_LINK_MOD)
 
+    def __init__(self):
+        self.env = {}
+
     def parse_wikilink(self, inline, m, state):
-        if m.group(4) and len(m.group(4)):
-            left, right = m.group(2), m.group(4)
+        # Re-match with standalone regex to access sub-groups
+        # (in the combined scanner, unnamed sub-groups shift and return None)
+        m2 = self.WIKI_LINK_MOD_RE.match(m.group(0))
+        if m2 and m2.group(4) and len(m2.group(4)):
+            left, right = m2.group(2), m2.group(4)
+        elif m2:
+            left, right = m2.group(2), m2.group(1)
         else:
-            left, right = m.group(2), m.group(1)
+            # fallback: treat entire match as link
+            left = right = m.group(0)[2:-2]
 
         WIKILINK_STYLE = inline.env.get("config", {}).get("WIKILINK_STYLE", "")
         if WIKILINK_STYLE.upper().replace("_", "").strip() in [
@@ -610,12 +779,22 @@ class mistunePluginWikiLink:
 
         # quote link (and just in case someone encoded already: unquote)
         link = urllib.parse.quote(urllib.parse.unquote(link), safe="/#")
-        return "wikilink", inline.render(title, state), link
+        # store env for later use in render
+        self.env = inline.env
 
-    def render_html_wikilink(self, text, link):
-        return '<a href="' + link + '">' + text + '</a>'
+        new_state = state.copy()
+        new_state.src = title
+        children = inline.render(new_state)
+        state.append_token(
+            {
+                'type': 'wikilink',
+                'children': children,
+                'attrs': {'link': link},
+            }
+        )
+        return m.end()
 
-    def before_parse(self, md, s, state):
+    def before_parse(self, md, state):
         def replace(match):
             if match.group(3) and len(match.group(3)):
                 return (
@@ -627,8 +806,7 @@ class mistunePluginWikiLink:
                 )
             return "[[" + match.group(1) + "]]"
 
-        s = self.WIKI_LINK_RE.sub(replace, s)
-        return s, state
+        state.src = self.WIKI_LINK_RE.sub(replace, state.src)
 
     def after_render(self, md, s, state):
         def replace(match):
@@ -643,43 +821,61 @@ class mistunePluginWikiLink:
         md.before_parse_hooks.append(self.before_parse)
         md.after_render_hooks.append(self.after_render)
 
-        md.inline.register_rule(
-            'wikilink', self.WIKI_LINK_MOD, self.parse_wikilink
+        md.inline.register(
+            'wikilink', self.WIKI_LINK_MOD, self.parse_wikilink, before='link'
         )
 
-        md.inline.rules.append('wikilink')
-
         if md.renderer.NAME == 'html':
-            md.renderer.register('wikilink', self.render_html_wikilink)
+            plugin = self
+
+            def render_html_wikilink(_renderer, text, link):
+                wikilink_html = '<a href="' + link + '">' + text + '</a>'
+                processed_html = chain_hooks(
+                    "renderer_process_wikilink",
+                    wikilink_html,
+                    link,
+                    text,
+                    plugin.env.get('page'),
+                )
+                return processed_html
+
+            md.renderer.register('wikilink', render_html_wikilink)
 
 
 class mistunePluginFrontmatter:
     FRONTMATTER_PATTERN = re.compile(r'^---\n(.*?)\n---', re.DOTALL)
+    # Pattern for registration with v3's block scanner (re.M only, no DOTALL):
+    # - Use \A instead of ^ so frontmatter only matches at the TRUE start of
+    #   the document (re.M makes ^ match at every line start, causing false
+    #   matches on any --- ... --- separator mid-document)
+    # - Use (?s:...) to embed DOTALL so . matches newlines
+    _FRONTMATTER_SCANNER_PATTERN = r'\A---\n(?s:(.*?))\n---'
 
     def parse_frontmatter(self, block, m, state):
-        frontmatter = m.group(1)
+        m2 = self.FRONTMATTER_PATTERN.match(m.group(0))
+        frontmatter = m2.group(1) if m2 else ""
         try:
-            if 'env' not in state:
-                state['env'] = {}
-            frontmatter_data = yaml.safe_load(frontmatter)
-            state['env']['frontmatter'] = frontmatter_data
+            if 'frontmatter' not in state.env:
+                frontmatter_data = yaml.safe_load(frontmatter)
+                state.env['frontmatter'] = frontmatter_data
 
-            # Extract title if it exists
-            if (
-                isinstance(frontmatter_data, dict)
-                and 'title' in frontmatter_data
-            ):
-                title = frontmatter_data['title']
-                if isinstance(title, str) and title.strip():
-                    state['env']['frontmatter_title'] = title.strip('"\'')
-        except Exception as e:
-            if 'env' not in state:
-                state['env'] = {}
-            state['env']['frontmatter'] = {}
-        return {
-            'type': 'frontmatter',
-            'text': frontmatter,
-        }
+                # Extract title if it exists
+                if (
+                    isinstance(frontmatter_data, dict)
+                    and 'title' in frontmatter_data
+                ):
+                    title = frontmatter_data['title']
+                    if isinstance(title, str) and title.strip():
+                        state.env['frontmatter_title'] = title.strip('"\'')
+        except Exception:
+            state.env['frontmatter'] = {}
+        state.append_token(
+            {
+                'type': 'frontmatter',
+                'raw': frontmatter,
+            }
+        )
+        return m.end()
 
     def render_html_frontmatter(self, text):
         text = text.strip()
@@ -687,19 +883,26 @@ class mistunePluginFrontmatter:
         <details class="collapse-panel" id="frontmatter">
             <summary class="collapse-header">Properties</summary>
             <div class="collapse-content">
-                <pre>{text}</pre>
+                <pre>{mistune.escape(text)}</pre>
             </div>
         </details>
         '''
 
     def __call__(self, md):
-        md.block.register_rule(
-            'frontmatter', self.FRONTMATTER_PATTERN, self.parse_frontmatter
+        md.block.register(
+            'frontmatter',
+            self._FRONTMATTER_SCANNER_PATTERN,
+            self.parse_frontmatter,
         )
-        md.block.rules.insert(0, 'frontmatter')  # Ensure it runs early
+        # Ensure frontmatter runs first
+        if 'frontmatter' in md.block.rules:
+            md.block.rules.remove('frontmatter')
+        md.block.rules.insert(0, 'frontmatter')
 
         if md.renderer.NAME == 'html':
-            md.renderer.register('frontmatter', self.render_html_frontmatter)
+            md.renderer.register(
+                'frontmatter', _rm(self.render_html_frontmatter)
+            )
 
 
 class mistunePluginFrontmatterTitle:
@@ -712,29 +915,25 @@ class mistunePluginFrontmatterTitle:
     or explicitly defining their own H1 headings in the markdown content.
     """
 
-    def before_parse(self, md, s, state):
+    def before_parse(self, md, state):
         # Initialize state if needed
-        if 'env' not in state:
-            state['env'] = {}
-        if 'has_h1_heading' not in state['env']:
-            state['env']['has_h1_heading'] = False
+        if 'has_h1_heading' not in state.env:
+            state.env['has_h1_heading'] = False
 
         # Check if the document has an H1 header
         # Look for ATX style headers (# Title) with proper regex
         # that accounts for optional spaces at start of line
         h1_pattern = re.compile(r'^\s*#\s+\S.*$', re.MULTILINE)
-        if h1_pattern.search(s):
-            state['env']['has_h1_heading'] = True
-
-        return s, state
+        if h1_pattern.search(state.src):
+            state.env['has_h1_heading'] = True
 
     def after_render(self, md, result, state):
         # Add H1 title if we have frontmatter title and no existing H1
-        if state.get('env', {}).get('frontmatter_title') and not state.get(
-            'env', {}
-        ).get('has_h1_heading', False):
-            title = state['env']['frontmatter_title']
-            h1_element = f'<h1>{title}</h1>'
+        if state.env.get('frontmatter_title') and not state.env.get(
+            'has_h1_heading', False
+        ):
+            title = state.env['frontmatter_title']
+            h1_element = f'<h1>{mistune.escape(title)}</h1>'
 
             # Insert after frontmatter if present
             if '<details class="collapse-panel" id="frontmatter">' in result:
@@ -753,6 +952,249 @@ class mistunePluginFrontmatterTitle:
         md.after_render_hooks.append(self.after_render)
 
 
+class mistunePluginEmbeddings:
+    EMBEDDING_RE = re.compile(
+        r"{{([A-Za-z ]+)(.*?)}}$", flags=re.MULTILINE | re.DOTALL
+    )
+    # Pattern with inline DOTALL for registration with v3's block scanner
+    # (which compiles with re.M only, so re.DOTALL flag is lost)
+    _EMBEDDING_SCANNER_PATTERN = r"{{(?s:([A-Za-z ]+)(.*?))}}$"
+
+    def parse_block(self, block, m, state):
+        cursor = False
+        end_pos = (
+            m.end()
+        )  # save original scanner match end before re-assigning m
+        # check if the cursor was set inside the embedding (in preview mode)
+        if cursormagicword in m.group(0):
+            cursor = True
+            m = self.EMBEDDING_RE.match(
+                m.group(0).replace(cursormagicword, "")
+            )
+            if not m:
+                return
+        else:
+            # Re-match with standalone regex so sub-groups are accessible
+            m = self.EMBEDDING_RE.match(m.group(0))
+            if not m:
+                return
+        children = []
+        # getting the embeddings name
+        embedding_name = m.group(1)
+        embedding_args = m.group(2)
+
+        # initialize results
+        args = EmbeddingArgs()
+        children = []
+
+        # check if the embedding is a one liner
+        embedding_in_one_line = "\n" not in embedding_args.strip()
+
+        # find all options: only lines that consist entirely of
+        # |key=value pairs are parsed as options, all other lines are
+        # content, so that markdown content like table rows containing
+        # = or | is not mangled, see #500
+        re_option = re.compile(
+            r"(?<!\\)\|((?:\\\||\\=|[^=\|\n])+)=((?:\\\||[^\|\n])+)",
+            flags=re.UNICODE,
+        )
+        re_option_line = re.compile(
+            r"[ \t]*(?:(?<!\\)\|(?:\\\||\\=|[^=\|\n])+=(?:\\\||[^\|\n])+)+[ \t]*",
+            flags=re.UNICODE,
+        )
+        content_lines = []
+        for line in embedding_args.split("\n"):
+            if not re_option_line.fullmatch(line):
+                content_lines.append(line)
+                continue
+            for match in re_option.finditer(line):
+                # key and value found
+                key = match.group(1).replace(r'\=', '=').replace(r'\|', '|')
+                value = match.group(2).replace(r'\|', '|')
+                # store raw value
+                args.options_raw[key.lower()] = value
+                # parse the option values and add them as children, this
+                # makes it possible to get the markdown parsed that may
+                # be used in the options
+                opt_child = state.child_state(value)
+                block.parse(opt_child)
+                # store children
+                children.append(
+                    {
+                        "type": "embedding_option",
+                        "children": opt_child.tokens,
+                        "attrs": {"key": key, "raw_value": value},
+                    }
+                )
+        embedding_args = "\n".join(content_lines)
+        # strip syntax artefact if one-line syntax is used
+        # FIXME: not completely happy with this
+        if (
+            embedding_in_one_line
+            and len(embedding_args)
+            and embedding_args[0] == "|"
+        ):
+            embedding_args = embedding_args[1:]
+
+        # what is left over in embedding_block is what we consider as
+        # embedding_args, \| and \= escapes in the content are handled
+        # by the markdown parser and the table plugins
+        args.args_raw = [embedding_args]
+
+        # parse the args, so that all markdown syntax can be used
+        args_child = state.child_state(embedding_args)
+        block.parse(args_child)
+
+        children.append(
+            {
+                "type": "embedding_option",
+                "children": args_child.tokens,
+                "attrs": {
+                    "key": None,
+                    "raw_value": embedding_args,
+                },
+            }
+        )
+        state.append_token(
+            {
+                "type": "embedding_block",
+                "attrs": {
+                    "embedding_name": embedding_name,
+                    "args": args,
+                    "cursor": cursor,
+                },
+                "children": children,
+            }
+        )
+        return end_pos
+
+    def render_html_block(
+        self,
+        text: str,
+        embedding_name: str,
+        args: EmbeddingArgs,
+        cursor: bool = False,
+    ):
+        for argument in text.splitlines():
+            parts = argument.rsplit(":", maxsplit=1)
+            value = base64.b64decode(parts[-1].encode()).decode()
+            if len(parts) == 1:
+                args.args.append(value)
+            elif len(parts) == 2:
+                args.options[parts[0]] = value
+
+        try:
+            output = call_hook(
+                "embedding_render",
+                embedding=embedding_name,
+                args=args,
+            )
+        except Exception as e:
+            # render exceptions in the output
+            output = f"<p class=\"text-danger\"><tt>{embedding_name}</tt> Error: {e}</p>"
+
+        if output is None:
+            # no ouput means either no embedding has been found or nothing was rendered.
+            output = f"<p class=\"text-danger\">Unknown Embedding:&nbsp;<tt>{embedding_name}</tt></p>"
+
+        if cursor:
+            return cursormagicword + output
+        return output
+
+    def render_embedding_option(self, value, key=None, raw_value=None):
+        # strip the <p>..</p>\n from the value
+        if value.startswith("<p>"):
+            value = value[3:]
+        if value.endswith("</p>\n"):
+            value = value[:-5]
+        # encode the value as base64
+        value = base64.b64encode(value.encode()).decode()
+        if key:
+            return f"{key}:{value}\n"
+        else:
+            return f"{value}\n"
+
+    def __call__(self, md):
+        md.block.register(
+            'embedding_block',
+            self._EMBEDDING_SCANNER_PATTERN,
+            self.parse_block,
+        )
+
+        md.renderer.register(
+            "embedding_option", _rm(self.render_embedding_option)
+        )
+
+        if md.renderer.NAME == "html":
+            md.renderer.register(
+                "embedding_block", _rm(self.render_html_block)
+            )
+
+
+class mistunePluginStrictTables:
+    """mistune 3.3 does not validate the delimiter row of a table: any
+    two consecutive lines with a matching number of unescaped pipes are
+    parsed as a table. Re-register the table and nptable rules with a
+    check that the second line is a valid delimiter row like
+    |---|:---:| before handing over to mistunes parse functions, as
+    GFM requires."""
+
+    DELIMITER_ROW_RE = re.compile(r' *:?-+:? *(?:\| *:?-+:? *)*')
+
+    def __call__(self, md):
+        from mistune.plugins.table import (
+            TABLE_PATTERN,
+            NP_TABLE_PATTERN,
+            parse_table,
+            parse_nptable,
+        )
+
+        def parse_table_strict(block, m, state):
+            row = state.get_line(m.end()).strip()
+            if not (row.startswith('|') and row.endswith('|')):
+                return None
+            if not self.DELIMITER_ROW_RE.fullmatch(row[1:-1]):
+                return None
+            return parse_table(block, m, state)
+
+        def parse_nptable_strict(block, m, state):
+            row = state.get_line(m.end()).strip()
+            if not self.DELIMITER_ROW_RE.fullmatch(row):
+                return None
+            return parse_nptable(block, m, state)
+
+        md.block.register(
+            'table', TABLE_PATTERN, parse_table_strict, before='paragraph'
+        )
+        md.block.register(
+            'nptable',
+            NP_TABLE_PATTERN,
+            parse_nptable_strict,
+            before='paragraph',
+        )
+
+
+class mistunePluginTableGfmPipes:
+    """Replace \\| with | in table cell content before inline parsing,
+    as GFM does, so that escaped pipes work inside code spans. Mistunes
+    table plugin splits the cells on unescaped pipes, but keeps the
+    backslash in the cell text, where the inline parser will not
+    unescape it inside code spans."""
+
+    def _unescape_pipes(self, tokens):
+        for tok in tokens:
+            if tok.get("type") == "table_cell":
+                tok["text"] = tok["text"].replace("\\|", "|")
+            if "children" in tok:
+                self._unescape_pipes(tok["children"])
+
+    def __call__(self, md):
+        def hook(md, state):
+            self._unescape_pipes(state.tokens)
+
+        md.before_render_hooks.append(hook)
+
+
 plugin_task_lists = mistunePluginTaskLists()
 plugin_footnotes = mistunePluginFootnotes()
 plugin_mark = mistunePluginMark()
@@ -764,3 +1206,6 @@ plugin_alerts = mistunePluginAlerts()
 plugin_wikilink = mistunePluginWikiLink()
 plugin_frontmatter = mistunePluginFrontmatter()
 plugin_frontmatter_title = mistunePluginFrontmatterTitle()
+plugin_embeddings = mistunePluginEmbeddings()
+plugin_strict_tables = mistunePluginStrictTables()
+plugin_table_gfm_pipes = mistunePluginTableGfmPipes()

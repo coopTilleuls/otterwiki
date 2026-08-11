@@ -59,13 +59,16 @@ def test_preferences_testmail(app_with_user, admin_client):
 def test_update_preferences(app_with_user, admin_client):
     new_name = "Test Wiki 4711"
     new_description = "another Test Wiki 4711"
+    new_server_name = "test_host"
     assert app_with_user.config['SITE_NAME'] != new_name
     assert app_with_user.config['SITE_DESCRIPTION'] != new_description
+    assert app_with_user.config['SERVER_NAME'] != new_server_name
     rv = admin_client.post(
         "/-/admin",
         data={
             "site_name": new_name,
             "site_description": new_description,
+            "server_name": new_server_name,
             "update_preferences": "true",
         },
         follow_redirects=True,
@@ -75,6 +78,7 @@ def test_update_preferences(app_with_user, admin_client):
     assert app_with_user.config['SITE_DESCRIPTION'] == new_description
     assert app_with_user.config['SITE_LOGO'] == ""
     assert app_with_user.config['SITE_ICON'] == ""
+    assert app_with_user.config['SERVER_NAME'] == new_server_name
 
 
 def test_update_preferences_logo_and_icon(app_with_user, admin_client):
@@ -87,6 +91,7 @@ def test_update_preferences_logo_and_icon(app_with_user, admin_client):
         data={
             "site_logo": new_logo,
             "site_icon": new_icon,
+            "server_name": "",
             "update_preferences": "true",
         },
         follow_redirects=True,
@@ -94,6 +99,7 @@ def test_update_preferences_logo_and_icon(app_with_user, admin_client):
     assert rv.status_code == 200
     assert app_with_user.config['SITE_LOGO'] == new_logo
     assert app_with_user.config['SITE_ICON'] == new_icon
+    assert app_with_user.config['SERVER_NAME'] == None
     # check html
     html = rv.data.decode()
     assert f"<link rel=\"icon\" href=\"{new_icon}\">" in html
@@ -288,6 +294,58 @@ def test_preferences_403(app_with_user, other_client):
     assert rv.status_code == 403
     rv = other_client.post(
         "/-/admin/content_and_editing", follow_redirects=True
+    )
+    assert rv.status_code == 403
+
+
+def test_permissions_post_requires_admin(app_with_user, other_client):
+    """POST to permissions_and_registration must return 403 for non-admin users
+    without following redirects — verifies the handler itself checks ADMIN,
+    not just the GET form renderer."""
+    rv = other_client.post(
+        "/-/admin/permissions_and_registration",
+        data={"READ_access": "ANONYMOUS"},
+    )
+    assert rv.status_code == 403
+
+
+def test_admin_endpoints_require_admin(app_with_user, other_client):
+    """All /-/admin endpoints must return 403 for non-admin users
+    on both GET and POST — verifies each handler checks ADMIN."""
+    endpoints = [
+        ("/-/admin", {"update_preferences": "true"}),
+        ("/-/admin/mail_preferences", {"mail_sender": "x@x.org"}),
+        ("/-/admin/sidebar_preferences", {}),
+        ("/-/admin/user_management", {"is_admin": [1]}),
+        (
+            "/-/admin/permissions_and_registration",
+            {"READ_access": "ANONYMOUS"},
+        ),
+        ("/-/admin/content_and_editing", {}),
+        ("/-/admin/repository_management", {}),
+    ]
+    for url, post_data in endpoints:
+        rv = other_client.get(url)
+        assert (
+            rv.status_code == 403
+        ), f"GET {url} expected 403, got {rv.status_code}"
+        rv = other_client.post(url, data=post_data)
+        assert (
+            rv.status_code == 403
+        ), f"POST {url} expected 403, got {rv.status_code}"
+
+
+def test_user_endpoints_require_admin(app_with_user, other_client):
+    """/-/user/ and /-/user/<id> must return 403 for non-admin users."""
+    # user edit
+    rv = other_client.get("/-/user/1")
+    assert rv.status_code == 403
+    rv = other_client.post("/-/user/1", data={"name": "x", "email": "x@x.org"})
+    assert rv.status_code == 403
+    # user add
+    rv = other_client.post(
+        "/-/user/",
+        data={"name": "New", "email": "new@new.org"},
     )
     assert rv.status_code == 403
 
@@ -490,7 +548,14 @@ def test_user_management(app_with_user, admin_client):
         follow_redirects=True,
     )
     assert rv.status_code == 200
-    assert "You can't remove all admins" in rv.data.decode()
+
+    soup = BeautifulSoup(rv.data.decode(), "html.parser")
+    scripts = soup.find_all("script", type="text/javascript")
+    assert scripts
+    assert any(
+        r"You can\u0026#39;t remove all admins" in script.text
+        for script in scripts
+    )
 
     # test prevention of removing all approved users
     rv = admin_client.post(
@@ -502,7 +567,13 @@ def test_user_management(app_with_user, admin_client):
         follow_redirects=True,
     )
     assert rv.status_code == 200
-    assert "You can't disable all users" in rv.data.decode()
+    soup = BeautifulSoup(rv.data.decode(), "html.parser")
+    scripts = soup.find_all("script", type="text/javascript")
+    assert scripts
+    assert any(
+        r"You can\u0026#39;t disable all users" in script.text
+        for script in scripts
+    )
 
     # test approved flag
     rv = admin_client.post(

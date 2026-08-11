@@ -1,6 +1,6 @@
 {#- vim: set et ts=8 sts=4 sw=4 ai: -#}
-{% if has_permission('READ') %}
-{% if menutree %}
+{%- if has_permission('READ') %}
+{%- if menutree %}
     <details class="collapse-panel" open>
 
         <summary class="collapse-header">
@@ -8,14 +8,14 @@
         </summary>
 
         <div class="collapse-content">
-            <!-- menutree [[ -->
+            {#- menutree [[ #}
             <ul class="sidebarmenu parent-sidebar-menu">
             {%- for key, value in menutree.items() recursive -%}
             {%- if value["children"] %}
             <li>
-                <details {% if pagepath and pagepath.lower().startswith(value.path.lower()) %}open{% endif %}>
+                <details {% if config.SIDEBAR_MENUTREE_FOCUS == "OFF" or (pagepath and pagepath.lower().startswith(value.path.lower())) %}open{% endif %}>
                     <summary class="sidebarmenu">
-                        <a href="/{{value["path"]}}">{{value["header"]}}</a>
+                        <a href="/{{value["path"]}}"{% if pagepath and pagepath.lower() == value.path.lower() %} aria-current="page"{% endif %}>{{value["header"]}}</a>
                     </summary>
                     <ul class="sidebarmenu sidebarmenu-loop-{{ loop.depth % 4 }}">{{ loop(value["children"].items())}}
                     </ul>
@@ -24,14 +24,18 @@
             {%- else %}
                 <li>
                     <div class="summary-details">
+                        {%- if pagepath and pagepath.lower() == value.path.lower() %}
+                        <a href="/{{value["path"]}}" aria-current="page">{{value["header"]}}</a>
+                        {%- else %}
                         <a href="/{{value["path"]}}">{{value["header"]}}</a>
+                        {%- endif %}
                     </div>
                 </li>
-            {%endif%}
+            {%- endif %}
             {%- endfor %}
             </ul>
-            <!-- ]] menutree -->
+            {#- ]] menutree #}
         </div>
     </details>
-{% endif %}{# if menutreee #}
-{% endif %}{# if has_permission('READ') #}
+{%- endif %}{# if menutreee #}
+{%- endif %}{# if has_permission('READ') #}

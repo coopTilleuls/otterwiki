@@ -2,8 +2,19 @@
 {% extends "form.html" %}
 {% block formcontent %}
 <form action="{{ url_for("login") }}" method="POST" class="form-inline">{# <!-- w-400 = width: 40rem (400px), mw-full = max-width: 100% --> #}
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 {% if next %}
     <input type="hidden" name="next" value="{{next}}">
+{% endif %}
+{% if message %}
+  <div class="form-group">
+    <div>
+      {{ message }}
+      {% if confirmation_url %}
+        <a href="{{ confirmation_url }}" class="btn btn-secondary">Resend confirmation link.</a>
+      {% endif %}
+    </div>
+  </div>
 {% endif %}
   <div class="form-group">
     <label for="email" class="required w-100">eMail Address</label>

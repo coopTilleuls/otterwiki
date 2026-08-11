@@ -7,6 +7,11 @@ import re
 from io import BytesIO
 from flask import url_for
 import bs4
+import pytest
+
+
+def _link_by_text(soup, text):
+    return soup.find("a", string=text)
 
 
 def test_html(test_client):
@@ -66,6 +71,7 @@ def test_create_page_in(test_client):
 
 
 def test_create_page(test_client, req_ctx):
+    test_client.application.config["RETAIN_PAGE_NAME_CASE"] = False
     pagename = "createtest"
     html = test_client.post(
         "/-/create",
@@ -148,6 +154,7 @@ def save_shortcut(test_client, pagename, content, commit_message):
 
 
 def test_pageindex(test_client):
+    test_client.application.config["RETAIN_PAGE_NAME_CASE"] = False
     save_shortcut(
         test_client,
         "Random page",
@@ -161,15 +168,35 @@ def test_pageindex(test_client):
         "added nested page",
     )
     html = test_client.get("/-/index").data.decode()
+    soup = bs4.BeautifulSoup(html, "html.parser")
     # check capitalizing (from # Random page)
-    assert 'Random page' in html
-    assert 'href="/Random%20page"' in html
+    a = _link_by_text(soup, "Random page")
+    assert a is not None
+    assert a.get("href") == "/Random page"
     # Test nested page
-    assert '>Nested page<' in html
-    assert 'href="/Sub%20Directory/Nested%20page"' in html
+    a = _link_by_text(soup, "Nested page")
+    assert a is not None
+    assert a.get("href") == "/Sub Directory/Nested page"
     # and nested header
-    assert '>Nested header<' in html
-    assert 'href="/Sub%20Directory/Nested%20page#nested-header"' in html
+    a = _link_by_text(soup, "Nested header")
+    assert a is not None
+    assert a.get("href") == "/Sub%20Directory/Nested%20page#nested-header"
+    # check data-index-path attribute
+    body = soup.find("body")
+    assert body
+    data_index_path = body.get("data-index-path", "")
+    assert data_index_path == "/"
+
+
+def test_sanitized_path_redirects_to_index(test_client):
+    """/%21 (!) gets sanitized to empty pagepath, should redirect to / with toast."""
+    rv = test_client.get("/%21")
+    assert rv.status_code == 302
+    assert rv.headers["Location"] == "/"
+    # follow the redirect and check for the toast message
+    rv = test_client.get("/%21", follow_redirects=True)
+    assert rv.status_code == 200
+    assert "Invalid pagename." in rv.data.decode()
 
 
 def test_page_save(test_client):
@@ -269,6 +296,31 @@ def test_view_commit(test_client, req_ctx):
     assert revision[0] in html
     assert content[0] in html
     assert content[1] in html
+
+
+def test_default_commit_message(test_client, create_app):
+    from time import strftime
+
+    pagename = "DefaultCommitTest"
+    content = ["aaa", "bbb"]
+    create_app.config["COMMIT_MESSAGE"] = "DISABLED"
+    create_app.config["DEFAULT_COMMIT_MESSAGE"] = ""
+    save_shortcut(test_client, pagename, content[0], commit_message="")
+    # check history
+    html = test_client.get("/{}/history".format(pagename)).data.decode()
+    assert "-/-" in html
+
+    # There is a slight race condition that could make this test fail
+    # if run at new years eve. If this had happend: Happy New Year!
+    create_app.config["DEFAULT_COMMIT_MESSAGE"] = "Updated %P in %Y"
+    save_shortcut(test_client, pagename, content[1], commit_message="")
+    # check history
+    html = test_client.get("/{}/history".format(pagename)).data.decode()
+    assert f"Updated {pagename} in {strftime('%Y')}" in html
+
+    # back to default
+    create_app.config["DEFAULT_COMMIT_MESSAGE"] = ""
+    create_app.config["COMMIT_MESSAGE"] = "OPTIONAL"
 
 
 def test_blame_and_history_and_diff(test_client):
@@ -524,6 +576,7 @@ def test_move_page(test_client):
 
 
 def test_nested_files(test_client):
+    test_client.application.config["RETAIN_PAGE_NAME_CASE"] = False
     p = test_client.application._otterwiki_tempdir
     _inner_folder = "a_folder/another_folder/"
     _file_name = "examplepage"
@@ -631,3 +684,106 @@ def test_meta_og(test_client):
     description = description.get("content", None)
     assert title == pagename
     assert description == "strong text with a link."
+
+
+@pytest.mark.parametrize(
+    "pagename, slug",
+    [
+        ("MyPage", "mypage"),
+        ("Sub/My Other Page", "sub/my-other-page"),
+        (
+            "'Lots' & \"Lots\" \U0001f525 of <Special Chars>",
+            "lots-lots-of-special-chars",
+        ),
+    ],
+)
+def test_data_pagepath_attribute(test_client, pagename, slug):
+    content = "# Data Page Path Test\n\nTesting data-page-path attribute."
+    commit_message = "Data page path test commit message"
+    save_shortcut(test_client, pagename, content, commit_message)
+    html = test_client.get("/{}".format(pagename)).data.decode()
+    soup = bs4.BeautifulSoup(html, "html.parser")
+    assert soup
+    body = soup.find("body")
+    assert body
+    data_page_path = body.get("data-page-path", "")
+    assert data_page_path == slug
+
+
+def test_data_indexpath_attribute(test_client):
+    pagename = "IndexPathTest/Page"
+    content = "# Data Index Path Test\n\nTesting data-index-path attribute."
+    commit_message = "Data index path test commit message"
+    save_shortcut(test_client, pagename, content, commit_message)
+    html = test_client.get("/IndexPathTest").data.decode()
+    soup = bs4.BeautifulSoup(html, "html.parser")
+    assert soup
+    body = soup.find("body")
+    assert body
+    data_index_path = body.get("data-index-path", "")
+    assert data_index_path == "indexpathtest"
+
+
+def _create_broken_utf8_page(storage, pagename="brokenutf8"):
+    """Helper: create a page with invalid UTF-8 bytes in the repo."""
+    filename = f"{pagename}.md"
+    # first create a valid commit so history exists
+    storage.store(
+        filename,
+        "# Valid\n\nValid content.",
+        author=("Test", "test@example.org"),
+        message=f"added {pagename}",
+    )
+    # overwrite with broken bytes and commit
+    broken_path = os.path.join(storage.path, filename)
+    with open(broken_path, "wb") as f:
+        f.write(b"# Broken\n\xff\xfe invalid utf8 sequence")
+    storage.commit(
+        [filename],
+        message=f"break {pagename}",
+        author=("Test", "test@example.org"),
+    )
+    # return both revisions
+    log = storage.log(filename)
+    return log[0]["revision"], log[1]["revision"]
+
+
+def test_page_view_broken_utf8(test_client, create_app):
+    """Viewing a page with broken UTF-8 shows the error in a danger alert."""
+    _create_broken_utf8_page(create_app.storage)
+    rv = test_client.get("/brokenutf8")
+    assert rv.status_code == 200
+    html = rv.data.decode()
+    assert "Storage error" in html
+    assert "could not be decoded as text" in html
+
+
+def test_page_view_broken_utf8_revision(test_client, create_app):
+    """Viewing a broken UTF-8 page at a specific revision shows the error."""
+    broken_rev, valid_rev = _create_broken_utf8_page(create_app.storage)
+    # broken revision should show the error
+    rv = test_client.get(f"/brokenutf8/view/{broken_rev}")
+    assert rv.status_code == 200
+    html = rv.data.decode()
+    assert "Storage error" in html
+    assert "could not be decoded as text" in html
+    # valid revision should render fine
+    rv = test_client.get(f"/brokenutf8/view/{valid_rev}")
+    assert rv.status_code == 200
+    html = rv.data.decode()
+    assert "Storage error" not in html
+    assert "Valid content" in html
+
+
+def test_page_source_broken_utf8(test_client, create_app):
+    """Source view of a page with broken UTF-8 returns 500."""
+    _create_broken_utf8_page(create_app.storage)
+    rv = test_client.get("/brokenutf8/source")
+    assert rv.status_code == 500
+
+
+def test_page_blame_broken_utf8(test_client, create_app):
+    """Blame view of a page with broken UTF-8 returns 500."""
+    _create_broken_utf8_page(create_app.storage)
+    rv = test_client.get("/brokenutf8/blame")
+    assert rv.status_code == 500

@@ -13,7 +13,7 @@ from flask import (
 
 from timeit import default_timer as timer
 
-from otterwiki.gitstorage import StorageNotFound
+from otterwiki.gitstorage import StorageError, StorageNotFound
 from otterwiki.server import app, db, storage
 from otterwiki.models import Drafts
 from otterwiki.auth import has_permission, get_author
@@ -127,7 +127,10 @@ def handle_housekeeping_emptypages(form):
             pass  # continue
         # read file
         pagename = get_pagename(filename, full=True)
-        content = storage.load(filename, size=512).strip()
+        try:
+            content = storage.load(filename, size=512).strip()
+        except StorageError:
+            continue
         if len(content) < 1:
             pages[pagename] = "Page is empty"
             continue
@@ -156,11 +159,145 @@ def handle_housekeeping_emptypages(form):
     )
 
 
+def handle_housekeeping_brokenwikilinks(form):
+    """Analyze pages for broken WikiLinks."""
+    if not has_permission("WRITE"):
+        abort(403)
+
+    # WikiLink pattern: [[Page Name]] or [[Page Name|Display Text]]
+    WIKI_LINK_PATTERN = re.compile(
+        r"\[\[(([^|\]]+)(?:#[^\]]*)?(?:(\|)([^\]]+))?)\]\]"
+    )
+    WIKILINK_STYLE = app.config.get("WIKILINK_STYLE", "")
+
+    t_start = timer()
+    files, directories = storage.list()
+    files_md = [f for f in files if f.endswith(".md")]
+
+    pages_with_broken_links = {}
+    broken_links_occurrences = {}
+
+    for filename in files_md:
+        try:
+            content = storage.load(filename)
+        except StorageError:
+            continue
+        current_pagename = get_pagename(filename, full=True)
+
+        wikilinks = WIKI_LINK_PATTERN.findall(content)
+
+        if not wikilinks:
+            continue
+
+        broken_links = []
+
+        for match in wikilinks:
+            # match[1] contains the first part (before | if present)
+            # match[3] contains the second part (after | if present)
+            left = match[1].strip()
+            right = match[3].strip() if match[3] else left
+
+            # default behavior: [[Title|Link]] or [[Title]]
+            # LINK_TITLE or PAGE_NAME_TITLE: [[Link|Title]] or [[Link]]
+            if WIKILINK_STYLE.upper().replace("_", "").strip() in [
+                "LINKTITLE",
+                "PAGENAMETITLE",
+            ]:
+                link_text = left
+            else:
+                link_text = right
+
+            if link_text.startswith("#"):
+                continue
+
+            # remove fragment for display
+            display_link = (
+                link_text.split("#")[0] if "#" in link_text else link_text
+            )
+
+            # resolve relative paths
+            page_path = (
+                link_text.split("#")[0] if "#" in link_text else link_text
+            )
+            page_path = page_path.lstrip("/")
+
+            if not page_path:
+                continue
+
+            if "../" in page_path:
+                current_dir = os.path.dirname(
+                    filename[:-3] if filename.endswith(".md") else filename
+                )
+                resolved_path = os.path.normpath(
+                    os.path.join(current_dir, page_path)
+                )
+                page_path = resolved_path.replace(os.sep, "/").lstrip("./")
+
+            page_file = get_filename(page_path)
+
+            # check if page exists as file or directory
+            page_exists = storage.exists(page_file) or storage.isdir(page_path)
+
+            if not page_exists:
+                broken_links.append(display_link)
+                if display_link not in broken_links_occurrences:
+                    broken_links_occurrences[display_link] = []
+                broken_links_occurrences[display_link].append(current_pagename)
+
+        if broken_links:
+            seen = set()
+            unique_broken_links = []
+            for link in broken_links:
+                if link not in seen:
+                    seen.add(link)
+                    unique_broken_links.append(link)
+            pages_with_broken_links[current_pagename] = unique_broken_links
+
+    pages_with_broken_links = dict(
+        sorted(
+            pages_with_broken_links.items(),
+            key=lambda item: len(item[1]),
+            reverse=True,
+        )
+    )
+
+    most_wanted_pages = []
+    for link_text, found_in_pages in broken_links_occurrences.items():
+        unique_found_in = list(dict.fromkeys(found_in_pages))
+        most_wanted_pages.append(
+            {
+                "page": link_text,
+                "found_in": unique_found_in,
+                "occurrences": len(unique_found_in),
+            }
+        )
+    most_wanted_pages.sort(key=lambda x: x["occurrences"], reverse=True)
+
+    duration = timer() - t_start
+    app.logger.debug(
+        f"housekeeping_brokenwikilinks scanning files took {duration:.3f} seconds."
+    )
+
+    stats = {
+        "pages": len(files_md),
+        "duration": f"{duration:.3f}s",
+    }
+
+    return render_template(
+        "tools/housekeeping_brokenwikilinks.html",
+        pages=pages_with_broken_links,
+        most_wanted=most_wanted_pages,
+        stats=stats,
+    )
+
+
 def handle_housekeeping(form):
     if form.get("task", None) == "drafts":
         return handle_housekeeping_drafts(form)
     if form.get("task", None) == "emptypages":
         return handle_housekeeping_emptypages(form)
+    if form.get("task", None) == "brokenwikilinks":
+        return handle_housekeeping_brokenwikilinks(form)
     # unkown task: display the form
     toast("Unkown task", "error")
     return redirect(url_for("housekeeping"))

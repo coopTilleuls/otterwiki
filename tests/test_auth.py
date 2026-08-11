@@ -4,6 +4,7 @@
 import pytest
 import re
 from flask import url_for
+from urllib.parse import urlparse
 
 
 def test_create_app_with_user(app_with_user):
@@ -153,7 +154,7 @@ def test_login_fail_wrong_password(app_with_user, test_client):
     assert "Invalid email address or password." in html
 
 
-def test_logout(test_client):
+def test_logout(app_with_user, test_client):
     result = login(test_client)
     html = test_client.get(
         "/-/logout",
@@ -228,6 +229,44 @@ def test_page_view_permissions(app_with_permissions, test_client):
     assert rv.status_code == 200
 
 
+def test_page_view_login_next_redirect(app_with_permissions, test_client):
+    # READ_ACCESS=REGISTERED: anonymous request to a page must redirect to
+    # login with a ?next= pointing back to that page, and logging in must
+    # forward the user back there.
+    app_with_permissions.config["READ_ACCESS"] = "REGISTERED"
+    rv = test_client.get(url_for("view", path="Home"))
+    assert rv.status_code == 302
+    assert "/-/login" in rv.location
+    assert "next=" in rv.location
+    assert "Home" in rv.location
+    # login with the next parameter as the login form would submit it
+    rv = test_client.post(
+        "/-/login",
+        data={
+            "email": "mail@example.org",
+            "password": "password1234",
+            "next": "/Home",
+        },
+    )
+    assert rv.status_code == 302
+    assert rv.location.endswith("/Home")
+    # rejects external next as open-redirect protection
+    rv = test_client.get("/-/logout", follow_redirects=True)
+    rv = test_client.post(
+        "/-/login",
+        data={
+            "email": "mail@example.org",
+            "password": "password1234",
+            "next": "//evil.example.com/",
+        },
+    )
+    assert rv.status_code == 302
+    # redirect stays local (relative path to the index), never to the external host
+    parsed = urlparse(rv.location)
+    assert parsed.netloc in ("", "localhost")
+    assert "evil.example.com" not in rv.location
+
+
 def test_page_blame_permissions(app_with_permissions, test_client):
     fun = "blame"
     app_with_permissions.config["READ_ACCESS"] = "ANONYMOUS"
@@ -236,8 +275,8 @@ def test_page_blame_permissions(app_with_permissions, test_client):
     assert "There is no place like Home." in rv.data.decode()
     app_with_permissions.config["READ_ACCESS"] = "REGISTERED"
     rv = test_client.get(url_for(fun, path="Home"))
-    assert rv.status_code == 403
-    assert "There is no place like Home." not in rv.data.decode()
+    assert rv.status_code == 302
+    assert "/-/login" in rv.location
     login(test_client)
     rv = test_client.get(url_for(fun, path="Home"))
     assert "There is no place like Home." in rv.data.decode()
@@ -251,8 +290,8 @@ def test_page_history_permissions(app_with_permissions, test_client):
     assert "initial test commit" in rv.data.decode()
     app_with_permissions.config["READ_ACCESS"] = "REGISTERED"
     rv = test_client.get(url_for(fun, path="Home"))
-    assert rv.status_code == 403
-    assert "initial test commit" not in rv.data.decode()
+    assert rv.status_code == 302
+    assert "/-/login" in rv.location
     login(test_client)
     rv = test_client.get(url_for(fun, path="Home"))
     assert rv.status_code == 200
@@ -267,8 +306,8 @@ def test_page_index_permissions(app_with_permissions, test_client):
     assert "Page Index" in rv.data.decode()
     app_with_permissions.config["READ_ACCESS"] = "REGISTERED"
     rv = test_client.get(url_for(fun))
-    assert rv.status_code == 403
-    assert "Page Index" not in rv.data.decode()
+    assert rv.status_code == 302
+    assert "/-/login" in rv.location
     login(test_client)
     rv = test_client.get(url_for(fun))
     assert rv.status_code == 200
@@ -283,8 +322,8 @@ def test_page_changelog_permissions(app_with_permissions, test_client):
     assert "initial test commit" in rv.data.decode()
     app_with_permissions.config["READ_ACCESS"] = "REGISTERED"
     rv = test_client.get(url_for(fun, path="Home"))
-    assert rv.status_code == 403
-    assert "initial test commit" not in rv.data.decode()
+    assert rv.status_code == 302
+    assert "/-/login" in rv.location
     login(test_client)
     rv = test_client.get(url_for(fun, path="Home"))
     assert rv.status_code == 200
@@ -560,7 +599,10 @@ def test_lost_password_form_address(app_with_user, test_client):
         },
         follow_redirects=True,
     )
-    assert "This email address is unknown." in rv.data.decode()
+    assert (
+        "If this email is registered, you will receive a password reset link."
+        in rv.data.decode()
+    )
 
 
 def test_lost_password_invalid_token(app_with_user, test_client):
@@ -579,6 +621,50 @@ def test_lost_password_invalid_token(app_with_user, test_client):
         follow_redirects=True,
     )
     assert "Invalid email address." in rv.data.decode()
+
+
+def test_lost_password_token_reuse(app_with_user, test_client, req_ctx):
+    """Password reset token must be single-use — second use is rejected."""
+    app_with_user.test_mail.state.suppress = True
+    with app_with_user.test_mail.record_messages() as outbox:
+        # Step 1: Request password reset
+        rv = test_client.post(
+            "/-/lost_password",
+            data={"email": "mail@example.org"},
+            follow_redirects=True,
+        )
+        assert len(outbox) == 1
+        # Extract token from email
+        m = re.search(
+            r"\/-\/recover_password\/(\S+)", outbox[0].body, flags=re.MULTILINE
+        )
+        assert m is not None
+        token = m.group(1)
+
+        # Step 2: First use — should succeed (logs in, redirects to settings)
+        rv = test_client.get(
+            f"/-/recover_password/{token}",
+            follow_redirects=True,
+        )
+        assert "please update your password." in rv.data.decode()
+
+        # Log out so we can test the token again
+        test_client.get("/-/logout")
+
+        # Step 3: Second use of same token — should be rejected
+        rv = test_client.get(
+            f"/-/recover_password/{token}",
+            follow_redirects=True,
+        )
+        result = rv.data.decode()
+        # Token must be rejected — should NOT see the success message
+        assert "please update your password." not in result
+        # Should see an error/rejection message
+        assert (
+            "Invalid" in result
+            or "expired" in result
+            or "already used" in result
+        )
 
 
 #
@@ -834,3 +920,369 @@ def test_user_with_empty_password_issues_204_205(app_with_user, test_client):
             follow_redirects=True,
         )
         assert "please update your password." in rv.data.decode()
+
+
+def test_register_first_user(create_app, test_client, req_ctx):
+    """
+    This test verifies that the first user that is registered becomes admin.
+    """
+    from otterwiki.auth import SimpleAuth, db
+
+    first_email = "admin@example.com"
+    second_email = "random@example.com"
+    password = "password1234"
+
+    db.session.query(SimpleAuth.User).delete()
+    # check users to make sure we start from scratch
+    assert len(SimpleAuth.User.query.all()) == 0
+    create_app.config["ADMIN_USER_EMAIL"] = ""
+
+    # Register random_email
+    rv = test_client.post(
+        "/-/register",
+        data={
+            "email": first_email,
+            "name": "Admin User",
+            "password1": password,
+            "password2": password,
+        },
+        follow_redirects=True,
+    )
+    assert rv.status_code == 200
+    # Register admin email
+    rv = test_client.post(
+        "/-/register",
+        data={
+            "email": second_email,
+            "name": "Random User",
+            "password1": password,
+            "password2": password,
+        },
+        follow_redirects=True,
+    )
+    assert rv.status_code == 200
+
+    admin_user = SimpleAuth.User.query.filter_by(email=first_email).first()
+    assert admin_user
+    assert admin_user.is_admin is True
+    random_user = SimpleAuth.User.query.filter_by(email=second_email).first()
+    assert random_user
+    assert random_user.is_admin is False
+    # clean up
+    db.session.query(SimpleAuth.User).delete()
+    create_app.config["ADMIN_USER_EMAIL"] = ""
+
+
+def test_register_first_admin_user_email(create_app, test_client, req_ctx):
+    """
+    This test verifies that with ADMIN_USER_EMAIL configured only user with
+    this email gets admin permissions
+    """
+    from otterwiki.auth import SimpleAuth, db
+
+    admin_email = "admin@example.com"
+    random_email = "random@example.com"
+    password = "password1234"
+
+    db.session.query(SimpleAuth.User).delete()
+    # check users to make sure we start from scratch
+    assert len(SimpleAuth.User.query.all()) == 0
+    create_app.config["ADMIN_USER_EMAIL"] = admin_email
+
+    # Register random_email
+    rv = test_client.post(
+        "/-/register",
+        data={
+            "email": random_email,
+            "name": "Random User",
+            "password1": password,
+            "password2": password,
+        },
+        follow_redirects=True,
+    )
+    assert rv.status_code == 200
+    # Register admin email
+    rv = test_client.post(
+        "/-/register",
+        data={
+            "email": admin_email,
+            "name": "Admin User",
+            "password1": password,
+            "password2": password,
+        },
+        follow_redirects=True,
+    )
+    assert rv.status_code == 200
+
+    admin_user = SimpleAuth.User.query.filter_by(email=admin_email).first()
+    assert admin_user
+    assert admin_user.is_admin is True
+    random_user = SimpleAuth.User.query.filter_by(email=random_email).first()
+    assert random_user
+    assert random_user.is_admin is False
+    # clean up
+    db.session.query(SimpleAuth.User).delete()
+    create_app.config["ADMIN_USER_EMAIL"] = ""
+
+
+def test_register_first_admin_user_email_disabled(
+    create_app, test_client, req_ctx
+):
+    """
+    This test verifies that even with ADMIN_USER_EMAIL configured
+    a user with this email does not get admin acccess if another admin is already registered.
+    This prevents edge cases where old admin users have been deleted and the config is forgotten.
+    """
+    from otterwiki.auth import SimpleAuth, db
+
+    admin_email = "admin@example.com"
+    random_email = "random@example.com"
+    password = "password1234"
+
+    db.session.query(SimpleAuth.User).delete()
+    # check users to make sure we start from scratch
+    assert len(SimpleAuth.User.query.all()) == 0
+
+    create_app.config["ADMIN_USER_EMAIL"] = ""
+    # Register random_email
+    rv = test_client.post(
+        "/-/register",
+        data={
+            "email": random_email,
+            "name": "Random User",
+            "password1": password,
+            "password2": password,
+        },
+        follow_redirects=True,
+    )
+    assert rv.status_code == 200
+
+    # enable ADMIN_USER_EMAIL, must have no effect since random_email already is admin
+    create_app.config["ADMIN_USER_EMAIL"] = admin_email
+    # Register admin email
+    rv = test_client.post(
+        "/-/register",
+        data={
+            "email": admin_email,
+            "name": "Admin User",
+            "password1": password,
+            "password2": password,
+        },
+        follow_redirects=True,
+    )
+    assert rv.status_code == 200
+
+    admin_user = SimpleAuth.User.query.filter_by(email=admin_email).first()
+    assert admin_user
+    assert admin_user.is_admin is False
+    random_user = SimpleAuth.User.query.filter_by(email=random_email).first()
+    assert random_user
+    assert random_user.is_admin is True
+    # clean up
+    db.session.query(SimpleAuth.User).delete()
+    create_app.config["ADMIN_USER_EMAIL"] = ""
+
+
+def test_login_redirect_next_parameter(app_with_user):
+    """Test that unauthenticated users are redirected to login with ?next="""
+    test_client = app_with_user.test_client()
+    # access a @login_required page without being logged in
+    rv = test_client.get("/-/settings", follow_redirects=False)
+    assert rv.status_code == 302
+    location = rv.headers["Location"]
+    assert "/-/login" in location
+    assert "next=" in location
+    assert "%2F-%2Fsettings" in location or "/-/settings" in location
+
+
+def test_login_next_shown_in_form(app_with_user):
+    """Test that the login form includes the next parameter."""
+    test_client = app_with_user.test_client()
+    rv = test_client.get("/-/login?next=%2F-%2Fsettings")
+    assert rv.status_code == 200
+    html = rv.data.decode()
+    # the next value should be present in a hidden form field
+    assert "/-/settings" in html
+
+
+def test_login_redirects_to_next_after_login(app_with_user):
+    """Test that after login the user is redirected to the next page."""
+    test_client = app_with_user.test_client()
+    rv = test_client.post(
+        "/-/login",
+        data={
+            "email": "mail@example.org",
+            "password": "password1234",
+            "next": "/-/settings",
+        },
+        follow_redirects=False,
+    )
+    assert rv.status_code == 302
+    location = rv.headers["Location"]
+    assert "/-/settings" in location
+
+
+def test_login_next_ignores_external_url(app_with_user):
+    """Test that external URLs in next are ignored (open redirect protection)."""
+    test_client = app_with_user.test_client()
+    rv = test_client.post(
+        "/-/login",
+        data={
+            "email": "mail@example.org",
+            "password": "password1234",
+            "next": "http://evil.example.com/steal",
+        },
+        follow_redirects=False,
+    )
+    assert rv.status_code == 302
+    location = rv.headers["Location"]
+    # must not redirect to the external URL
+    parsed = urlparse(location)
+    assert parsed.netloc in ("", "localhost")
+    assert "evil.example.com" not in location
+
+
+def test_login_next_whitespace_bypass(app_with_user):
+    """Test that control-character bypasses like /\\t//evil.com are neutralised.
+
+    Browsers may strip control characters (tab, newline, carriage return)
+    from URLs, turning /\\t//evil.com into //evil.com (a protocol-relative
+    external redirect). Backslash variants like /\\evil.com are also rejected
+    because browsers normalise the backslash to a forward slash, turning them
+    into protocol-relative //evil.com redirects too.
+    """
+    test_client = app_with_user.test_client()
+    for malicious_next in [
+        "/\t//evil.com",
+        "/\n//evil.com",
+        "/\r//evil.com",
+        "//evil.com",
+        "/\\evil.com",
+        "/\\/evil.com",
+        "/\t/\\evil.com",
+    ]:
+        rv = test_client.get("/-/logout", follow_redirects=True)
+        rv = test_client.post(
+            "/-/login",
+            data={
+                "email": "mail@example.org",
+                "password": "password1234",
+                "next": malicious_next,
+            },
+            follow_redirects=False,
+        )
+        assert (
+            rv.status_code == 302
+        ), f"expected 302 for next={repr(malicious_next)}"
+        location = rv.headers["Location"]
+        parsed = urlparse(location)
+        assert parsed.netloc in ("", "localhost"), (
+            f"redirect netloc should be local for next={repr(malicious_next)}, "
+            f"got {parsed.netloc!r}"
+        )
+        assert "evil.com" not in location, (
+            f"redirect must not target evil.com for next={repr(malicious_next)}, "
+            f"got {location!r}"
+        )
+
+
+def test_login_next_redirect_is_relative(app_with_user):
+    """Regression test for #517.
+
+    The login redirect must be a relative path so the browser resolves it
+    against the host and port the request was made to. Prepending an absolute
+    host URL broke logins behind a reverse proxy or on a non-standard port
+    (e.g. the user ended up on localhost:80 instead of localhost:9091).
+    """
+    test_client = app_with_user.test_client()
+    for next_page in ["/Home", "/-/settings", ""]:
+        rv = test_client.get("/-/logout", follow_redirects=True)
+        rv = test_client.post(
+            "/-/login",
+            data={
+                "email": "mail@example.org",
+                "password": "password1234",
+                "next": next_page,
+            },
+            follow_redirects=False,
+        )
+        assert rv.status_code == 302
+        location = rv.headers["Location"]
+        # the Location header must be a relative path, not an absolute URL with
+        # a hardcoded scheme/host
+        parsed = urlparse(location)
+        assert (
+            parsed.scheme == ""
+        ), f"redirect must be relative, got {location!r}"
+        assert (
+            parsed.netloc == ""
+        ), f"redirect must be relative, got {location!r}"
+        assert location.startswith("/")
+
+
+def test_login_next_empty_redirects_to_index(app_with_user):
+    """Test that an empty next value redirects to the index."""
+    test_client = app_with_user.test_client()
+    rv = test_client.post(
+        "/-/login",
+        data={
+            "email": "mail@example.org",
+            "password": "password1234",
+            "next": "",
+        },
+        follow_redirects=False,
+    )
+    assert rv.status_code == 302
+    location = rv.headers["Location"]
+    assert location.endswith("/")
+
+
+def test_login_next_preserved_on_failed_login(app_with_user):
+    """Test that the next parameter is preserved when login fails."""
+    test_client = app_with_user.test_client()
+    rv = test_client.post(
+        "/-/login",
+        data={
+            "email": "mail@example.org",
+            "password": "wrongpassword",
+            "next": "/-/settings",
+        },
+        follow_redirects=True,
+    )
+    assert rv.status_code == 200
+    html = rv.data.decode()
+    assert "/-/settings" in html
+    assert "Invalid email address or password." in html
+
+
+def test_login_next_full_flow(app_with_user):
+    """Test the full flow: access protected page -> login -> redirected back."""
+    test_client = app_with_user.test_client()
+    # step 1: access protected page, get redirected to login
+    rv = test_client.get("/-/settings", follow_redirects=False)
+    assert rv.status_code == 302
+    login_url = rv.headers["Location"]
+    assert "/-/login" in login_url
+
+    # step 2: follow redirect to login page
+    rv = test_client.get(login_url)
+    assert rv.status_code == 200
+    html = rv.data.decode()
+    assert "/-/settings" in html
+
+    # step 3: submit login with next parameter
+    rv = test_client.post(
+        "/-/login",
+        data={
+            "email": "mail@example.org",
+            "password": "password1234",
+            "next": "/-/settings",
+        },
+        follow_redirects=False,
+    )
+    assert rv.status_code == 302
+    assert "/-/settings" in rv.headers["Location"]
+
+    # step 4: follow redirect to the original page
+    rv = test_client.get(rv.headers["Location"])
+    assert rv.status_code == 200

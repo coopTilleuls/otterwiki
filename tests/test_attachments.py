@@ -40,6 +40,20 @@ def app_with_attachments(create_app):
         mode="wb",
     )
     assert True == create_app.storage.exists("test/attachment1.gif")
+    # create svg attachment
+    message = "Test/attachment2.svg attach2-commit"
+    svg_content = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">'
+        '<rect width="10" height="10" fill="red"/></svg>'
+    )
+    create_app.storage.store(
+        "test/attachment2.svg",
+        content=svg_content,
+        author=author,
+        message=message,
+    )
+    assert True == create_app.storage.exists("test/attachment2.svg")
     yield create_app
 
 
@@ -101,6 +115,16 @@ def test_thumbnail(test_client):
     # test thumbnail
     response = test_client.get("/Test/attachment1.gif?thumbnail=10")
     assert response.status_code == 200
+
+
+def test_thumbnail_svg(test_client):
+    # SVG cannot be processed by PIL; the original file must be served
+    response = test_client.get("/Test/attachment2.svg?thumbnail")
+    assert response.status_code == 200
+    assert b"<svg" in response.data
+    response = test_client.get("/Test/attachment2.svg?thumbnail=10")
+    assert response.status_code == 200
+    assert b"<svg" in response.data
 
 
 def test_rename_attachment(test_client, req_ctx):

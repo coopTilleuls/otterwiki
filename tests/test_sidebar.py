@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 # vim: set et ts=8 sts=4 sw=4 ai:
 
+import os
+
 from bs4 import BeautifulSoup
 
 
@@ -67,7 +69,7 @@ def test_sidebar_shortcuts_empty(create_app, test_client):
 
 def get_sidebar_menu(test_client):
     """
-    Helper function to get all links in the custom menu
+    Helper function to get all elements in the custom menu including links and separators
     """
     rv = test_client.get("/")
     assert rv.status_code == 200
@@ -75,11 +77,32 @@ def get_sidebar_menu(test_client):
     sidebar_custom_menu = soup.find("div", id="custom-menu")
     if sidebar_custom_menu is None:
         return None
-    sidebar_custom_links = sidebar_custom_menu.find_all("a")  # pyright: ignore
+
+    menu_items = []
+    ul = sidebar_custom_menu.find("ul")
+    if ul:
+        for li in ul.find_all("li"):
+            if li.find("hr"):
+                menu_items.append({"type": "separator"})
+            elif li.find("a"):
+                a = li.find("a")
+                menu_items.append(
+                    {
+                        "type": "link",
+                        "text": a.text.strip(),
+                        "href": a["href"],
+                        "html": str(a),
+                    }
+                )
+
+    # for backward compatibility, also return just the links in the old format
     sidebar_custom_links = [
-        (x.text.strip(), x["href"]) for x in sidebar_custom_links
+        (item["text"], item["href"])
+        for item in menu_items
+        if item["type"] == "link"
     ]
-    return sidebar_custom_links
+
+    return {"items": menu_items, "links": sidebar_custom_links}
 
 
 def test_sidebar_custom_menu(create_app, test_client, req_ctx):
@@ -87,21 +110,21 @@ def test_sidebar_custom_menu(create_app, test_client, req_ctx):
 
     create_app.config["SIDEBAR_CUSTOM_MENU"] = ""
     assert SidebarMenu().config == []
-    links = get_sidebar_menu(test_client)
-    assert links is None
+    menu_data = get_sidebar_menu(test_client)
+    assert menu_data is None
 
     create_app.config["SIDEBAR_CUSTOM_MENU"] = "[]"
     assert [] == SidebarMenu().config
-    links = get_sidebar_menu(test_client)
-    assert links is None
+    menu_data = get_sidebar_menu(test_client)
+    assert menu_data is None
 
     create_app.config["SIDEBAR_CUSTOM_MENU"] = (
         """[{"link": "Home", "title": ""}]"""
     )
-    assert [{'link': 'Home', 'title': ''}] == SidebarMenu().config
-    links = get_sidebar_menu(test_client)
-    assert links
-    assert ('Home', '/Home') in links
+    assert [{'link': 'Home', 'title': '', 'icon': ''}] == SidebarMenu().config
+    menu_data = get_sidebar_menu(test_client)
+    assert menu_data
+    assert ('Home', '/Home') in menu_data["links"]
 
     create_app.config["SIDEBAR_CUSTOM_MENU"] = (
         """[{"link":"https://example.com", "title":"Example"}]"""
@@ -109,18 +132,21 @@ def test_sidebar_custom_menu(create_app, test_client, req_ctx):
     assert {
         "title": "Example",
         "link": "https://example.com",
+        "icon": "",
     } in SidebarMenu().config
-    links = get_sidebar_menu(test_client)
-    assert links
-    assert ('Example', 'https://example.com') in links
+    menu_data = get_sidebar_menu(test_client)
+    assert menu_data
+    assert ('Example', 'https://example.com') in menu_data["links"]
 
     create_app.config["SIDEBAR_CUSTOM_MENU"] = (
         """[{"link": "/Example", "title": ""}]"""
     )
-    assert [{'link': '/Example', 'title': ''}] == SidebarMenu().config
-    links = get_sidebar_menu(test_client)
-    assert links
-    assert ('/Example', '/Example') in links
+    assert [
+        {'link': '/Example', 'title': '', 'icon': ''}
+    ] == SidebarMenu().config
+    menu_data = get_sidebar_menu(test_client)
+    assert menu_data
+    assert ('/Example', '/Example') in menu_data["links"]
 
 
 def test_sidebar_custom_menu_error(create_app, test_client, req_ctx):
@@ -128,5 +154,228 @@ def test_sidebar_custom_menu_error(create_app, test_client, req_ctx):
 
     create_app.config["SIDEBAR_CUSTOM_MENU"] = "["
     assert SidebarMenu().config == []
-    links = get_sidebar_menu(test_client)
-    assert links is None
+    menu_data = get_sidebar_menu(test_client)
+    assert menu_data is None
+
+
+def test_sidebar_custom_menu_with_icons(create_app, test_client, req_ctx):
+    from otterwiki.sidebar import SidebarMenu
+
+    create_app.config["SIDEBAR_CUSTOM_MENU"] = (
+        """[{"link": "Home", "title": "Home Page", "icon": "<i class=\\"fas fa-home\\"></i>"}]"""
+    )
+    config = SidebarMenu().config
+    assert len(config) == 1
+    assert config[0]["link"] == "Home"
+    assert config[0]["title"] == "Home Page"
+    assert config[0]["icon"] == '<i class="fas fa-home"></i>'
+
+    menu_data = get_sidebar_menu(test_client)
+    assert menu_data is not None
+    assert len(menu_data["items"]) == 1
+    assert menu_data["items"][0]["type"] == "link"
+    assert '<i class="fas fa-home"></i>' in menu_data["items"][0]["html"]
+    assert "Home Page" in menu_data["items"][0]["text"]
+
+
+def test_sidebar_custom_menu_with_separator(create_app, test_client, req_ctx):
+    from otterwiki.sidebar import SidebarMenu
+
+    create_app.config["SIDEBAR_CUSTOM_MENU"] = (
+        """[{"link": "Home", "title": "Home Page", "icon": ""}, {"link": "---", "title": "", "icon": ""}, {"link": "About", "title": "About Page", "icon": ""}]"""
+    )
+    config = SidebarMenu().config
+    assert len(config) == 3
+
+    menu_data = get_sidebar_menu(test_client)
+    assert menu_data is not None
+    assert len(menu_data["items"]) == 3
+    assert menu_data["items"][0]["type"] == "link"
+    assert menu_data["items"][1]["type"] == "separator"
+    assert menu_data["items"][2]["type"] == "link"
+
+
+def test_sidebar_custom_menu_backward_compatibility(
+    create_app, test_client, req_ctx
+):
+    from otterwiki.sidebar import SidebarMenu
+
+    create_app.config["SIDEBAR_CUSTOM_MENU"] = (
+        """[{"link": "Home", "title": "Home Page"}]"""
+    )
+    config = SidebarMenu().config
+    assert len(config) == 1
+    assert config[0]["link"] == "Home"
+    assert config[0]["title"] == "Home Page"
+    assert config[0]["icon"] == ""
+
+    menu_data = get_sidebar_menu(test_client)
+    assert menu_data is not None
+    assert ("Home Page", "/Home") in menu_data["links"]
+
+
+def test_sidebar_menutree_with_invalid_utf8(create_app, req_ctx):
+    """Sidebar menu tree renders valid pages even when one has invalid UTF-8."""
+    from otterwiki.sidebar import SidebarPageIndex
+
+    storage = create_app.storage
+
+    # create valid pages
+    storage.store(
+        "ValidPage.md",
+        "# Valid Page\n\nSome content.",
+        author=("Test", "test@example.org"),
+    )
+    storage.store(
+        "AnotherPage.md",
+        "# Another Page\n\nMore content.",
+        author=("Test", "test@example.org"),
+    )
+
+    # write a file with invalid UTF-8 bytes directly to the repo
+    broken_path = os.path.join(storage.path, "BrokenPage.md")
+    with open(broken_path, "wb") as f:
+        f.write(b"# Broken\n\xff\xfe invalid utf8 sequence")
+    storage.commit(
+        ["BrokenPage.md"],
+        message="add broken page",
+        author=("Test", "test@example.org"),
+    )
+
+    # disable focus so the sidebar loads all pages
+    create_app.config["SIDEBAR_MENUTREE_FOCUS"] = "OFF"
+    tree = SidebarPageIndex(path="/").query()
+    page_names = list(tree.keys())
+
+    # all three pages (plus the default Home) should be present
+    assert "ValidPage" in page_names
+    assert "AnotherPage" in page_names
+    assert "BrokenPage" in page_names
+
+    # valid pages have their markdown header extracted
+    valid_headers = dict(
+        (fn, h) for fn, h in SidebarPageIndex(path="/").filenames_and_header
+    )
+    assert valid_headers["ValidPage"] == "Valid Page"
+    assert valid_headers["AnotherPage"] == "Another Page"
+    # broken page header could not be read, falls back to None
+    assert valid_headers["BrokenPage"] is None
+
+
+def _populate_menutree_fixture(storage):
+    """Create a small folder tree used by the focus-option tests."""
+    storage.store(
+        "Alpha/PageA.md",
+        "# Page A",
+        author=("Test", "test@example.org"),
+    )
+    storage.store(
+        "Beta/PageB.md",
+        "# Page B",
+        author=("Test", "test@example.org"),
+    )
+    storage.store(
+        "Beta/Sub/PageBB.md",
+        "# Page BB",
+        author=("Test", "test@example.org"),
+    )
+    storage.store(
+        "TopLevel.md",
+        "# Top Level",
+        author=("Test", "test@example.org"),
+    )
+
+
+def test_sidebar_menutree_focus_subtree(create_app, req_ctx):
+    """SUBTREE only loads parents and siblings of the current page."""
+    from otterwiki.sidebar import SidebarPageIndex
+
+    create_app.config["RETAIN_PAGE_NAME_CASE"] = True
+    _populate_menutree_fixture(create_app.storage)
+    create_app.config["SIDEBAR_MENUTREE_FOCUS"] = "SUBTREE"
+
+    # viewing a page under Alpha must not load the Beta subtree
+    tree = SidebarPageIndex(path="Alpha/PageA").query()
+    assert "Alpha" in tree
+    assert "Beta" not in tree
+
+
+def test_sidebar_menutree_focus_top_loads_all(create_app, req_ctx):
+    """TOP loads every page, just like OFF (only template behavior differs)."""
+    from otterwiki.sidebar import SidebarPageIndex
+
+    create_app.config["RETAIN_PAGE_NAME_CASE"] = True
+    _populate_menutree_fixture(create_app.storage)
+    create_app.config["SIDEBAR_MENUTREE_FOCUS"] = "TOP"
+
+    tree = SidebarPageIndex(path="Alpha/PageA").query()
+    assert "Alpha" in tree
+    assert "Beta" in tree
+    assert "TopLevel" in tree
+
+
+def test_sidebar_menutree_focus_off_loads_all(create_app, req_ctx):
+    from otterwiki.sidebar import SidebarPageIndex
+
+    create_app.config["RETAIN_PAGE_NAME_CASE"] = True
+    _populate_menutree_fixture(create_app.storage)
+    create_app.config["SIDEBAR_MENUTREE_FOCUS"] = "OFF"
+
+    tree = SidebarPageIndex(path="Alpha/PageA").query()
+    assert "Alpha" in tree
+    assert "Beta" in tree
+    assert "TopLevel" in tree
+
+
+def _menutree_details(html):
+    """Return the <details> elements inside the rendered sidebar page index."""
+    soup = BeautifulSoup(html, "html.parser")
+    panels = soup.find_all("details", class_="collapse-panel")
+    # the page index panel contains a <summary> "Page Index"
+    for panel in panels:
+        summary = panel.find("summary")
+        if summary and "Page Index" in summary.get_text():
+            return panel.find_all("details")
+    return []
+
+
+def test_sidebar_menutree_focus_top_folders_stay_folded(
+    create_app, test_client
+):
+    """With TOP, folders not on the current path render closed."""
+    create_app.config["RETAIN_PAGE_NAME_CASE"] = True
+    _populate_menutree_fixture(create_app.storage)
+    create_app.config["SIDEBAR_MENUTREE_FOCUS"] = "TOP"
+
+    rv = test_client.get("/Alpha/PageA")
+    assert rv.status_code == 200
+    details = _menutree_details(rv.data.decode())
+
+    folder_state = {
+        d.find("summary").find("a").get_text().strip(): d.has_attr("open")
+        for d in details
+    }
+    # current path open, others folded
+    assert folder_state.get("Alpha") is True
+    assert folder_state.get("Beta") is False
+    assert folder_state.get("Sub") is False
+
+
+def test_sidebar_menutree_focus_off_unfolds_everything(
+    create_app, test_client
+):
+    """With OFF, every folder in the index renders open."""
+    create_app.config["RETAIN_PAGE_NAME_CASE"] = True
+    _populate_menutree_fixture(create_app.storage)
+    create_app.config["SIDEBAR_MENUTREE_FOCUS"] = "OFF"
+
+    rv = test_client.get("/Alpha/PageA")
+    assert rv.status_code == 200
+    details = _menutree_details(rv.data.decode())
+
+    # every folder rendered must be open
+    assert details
+    for d in details:
+        assert d.has_attr(
+            "open"
+        ), f"folder {d.find('summary').get_text(strip=True)!r} should be open"
