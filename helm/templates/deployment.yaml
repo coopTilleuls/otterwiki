@@ -59,24 +59,22 @@ spec:
             - name: http
               containerPort: {{ .Values.service.port }}
               protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /-/healthz
+              port: http
+            failureThreshold: 30
+            periodSeconds: 1
+            timeoutSeconds: 1
+            initialDelaySeconds: 1
           livenessProbe:
             httpGet:
               path: /-/healthz
               port: http
-            failureThreshold: 3
-            successThreshold: 1
-            periodSeconds: 60
-            timeoutSeconds: 10
-            initialDelaySeconds: 1
           readinessProbe:
             httpGet:
               path: /-/healthz
               port: http
-            failureThreshold: 3
-            successThreshold: 1
-            periodSeconds: 60
-            timeoutSeconds: 10
-            initialDelaySeconds: 1
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           {{- if .Values.persistence.enabled }}
