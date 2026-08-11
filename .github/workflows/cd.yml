@@ -17,14 +17,3 @@ jobs:
         type=semver,pattern={{major}}.{{minor}}
         type=sha
 
-  deploy:
-    name: Deploy
-    if: github.event_name != 'pull_request' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'deploy'))
-    needs: [ build ]
-    uses: ./.github/workflows/deploy.yml
-    concurrency: ${{ github.ref }}-deploy
-    secrets:
-      project-id: ${{ secrets.PROJECT_ID }}
-      workload-identity-provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
-      google_client_id: ${{ secrets.GOOGLE_CLIENT_ID }}
-      google_client_secret: ${{ secrets.GOOGLE_CLIENT_SECRET }}
