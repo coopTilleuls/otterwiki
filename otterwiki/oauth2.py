@@ -7,6 +7,7 @@ from flask import abort, redirect, request, session, url_for
 from oauthlib.oauth2 import WebApplicationClient
 from otterwiki.server import app
 from otterwiki.auth import auth_manager
+from otterwiki.util import sanitize_next_url
 
 # Configuration
 OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", None)
@@ -33,6 +34,9 @@ def oauth2_login():
     # random state, checked against the callback to prevent login CSRF
     state = secrets.token_urlsafe(32)
     session["oauth2_state"] = state
+    # remember where the user was headed so the callback can send them
+    # back there instead of dropping them on the index page
+    session["oauth2_next"] = sanitize_next_url(request.args.get("next"))
 
     # Use library to construct the request for Google login and provide
     # scopes that let you retrieve user's profile from Google
@@ -110,5 +114,6 @@ def gcp_callback():
     auth_manager.handle_login(
         id=unique_id, name=users_name, email=users_email, profile_pic=picture
     )
-    return redirect("/")
+    next_page = sanitize_next_url(session.pop("oauth2_next", None))
+    return redirect(next_page)
 

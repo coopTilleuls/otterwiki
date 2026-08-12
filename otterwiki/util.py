@@ -20,6 +20,24 @@ from unidiff import PatchSet
 cursormagicword = "CuRsoRm4g1cW0Rd"
 
 
+def sanitize_next_url(next_url, default="/"):
+    """Validate a redirect target from a 'next' query/form parameter.
+
+    Only local, single-slash relative paths are allowed to prevent
+    open-redirect attacks (protocol-relative "//evil.com", absolute
+    "http://evil.com" and backslash variants "/\\evil.com" that browsers
+    normalise to "//evil.com" are all rejected).
+    """
+    if not next_url:
+        return default
+    # strip control characters that browsers may ignore but that can be
+    # used to bypass open-redirect checks (e.g. /\t//evil.com)
+    next_url = re.sub(r"[\t\n\r]", "", next_url)
+    if not next_url.startswith('/') or next_url[1:2] in ('/', '\\'):
+        return default
+    return next_url
+
+
 def ttl_lru_cache(ttl: int = 60, maxsize: int = 128):
     """
     Time aware lru caching thx to https://stackoverflow.com/a/73026174/212768

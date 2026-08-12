@@ -35,7 +35,7 @@ from otterwiki.helper import (
 from otterwiki.models import User as UserModel
 from otterwiki.server import app, db
 from otterwiki.util import is_valid_email, is_valid_name
-from otterwiki.util import random_password, empty
+from otterwiki.util import random_password, empty, sanitize_next_url
 
 
 def check_password_hash_backport(pwhash, password):
@@ -169,24 +169,10 @@ class SimpleAuth:
                 return redirect(url_for("login"))
             # login
             login_user(user, remember=remember is not None)
-            # set next_page
-            if next_page:
-                # strip control characters that browsers may ignore but that
-                # can be used to bypass open-redirect checks (e.g. /\t//evil.com)
-                next_page = re.sub(r"[\t\n\r]", "", next_page)
-            # only allow redirects to a local path; reject anything that is not
-            # a single-slash relative path to prevent open redirects. keep
-            # next_page relative so the redirect targets the host the request
-            # was made to, even behind a reverse proxy or on a non-standard
-            # port. reject protocol-relative ("//evil.com") and absolute
-            # ("http://evil.com") urls, as well as backslash variants
-            # ("/\evil.com") that browsers normalise to "//evil.com"
-            if (
-                not next_page
-                or not next_page.startswith('/')
-                or next_page[1:2] in ('/', '\\')
-            ):
-                next_page = url_for("index")
+            # only allow redirects to a local path; keep next_page relative so
+            # the redirect targets the host the request was made to, even
+            # behind a reverse proxy or on a non-standard port.
+            next_page = sanitize_next_url(next_page, default=url_for("index"))
             # check if the users password_hash is going to be deprecated
             if user.password_hash.startswith("sha256$"):
                 app.logger.warning(
