@@ -12,7 +12,7 @@ ingress:
   enabled: false
 
 envFromSecret:
-  secretName: google-auth
+  secretName: external-secrets
 
 # No per-host TLS needed: the shared Traefik Gateway on this cluster terminates
 # with a wildcard cert for *.lt-mut-nonprod-scw.les-tilleuls.solutions.

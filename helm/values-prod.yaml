@@ -21,7 +21,7 @@ ingress:
       hosts:
         - wiki.lt-mut-prod.les-tilleuls.solutions
 envFromSecret:
-  secretName: google-auth
+  secretName: external-secrets
 route:
   host: wiki-sre.les-tilleuls.solutions
 
