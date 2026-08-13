@@ -2,7 +2,7 @@
 # Used to test future OtterWiki image upgrades before rolling them out to prod.
 # Usage: helm upgrade --install otter-wiki . --values ./values.yaml --values ./values-nonprod.yaml --set ...
 image:
-  repository: ghcr.io/cooptilleuls/otterwiki
+  repository: rg.fr-par.scw.cloud/infra-mut-cr-scw/otterwiki
   tag: t1.9.3
 
 imagePullSecrets:
