@@ -2,7 +2,7 @@ name: CD
 on:
   push:
     tags:
-      - '*'
+      - 'nonprod-*'
 jobs:
   build:
     name: Build
