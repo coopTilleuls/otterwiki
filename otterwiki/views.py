@@ -11,7 +11,6 @@ from flask import (
     render_template,
     make_response,
     redirect,
-    url_for,
     jsonify,
     g,
 )
@@ -21,6 +20,9 @@ from otterwiki.wiki import (
     Changelog,
     Search,
     AutoRoute,
+    get_internal_page_symlink_target,
+    redirect_internal_page_symlink,
+    redirect_internal_directory_symlink,
 )
 from otterwiki.sitemap import sitemap as generate_sitemap
 from otterwiki.pageindex import PageIndex
@@ -30,6 +32,7 @@ import otterwiki.preferences
 import otterwiki.tools
 from otterwiki.renderer import render
 from otterwiki.helper import (
+    url_for,
     toast,
     health_check,
     get_pagename_prefixes,
@@ -492,13 +495,35 @@ def request_confirmation_link(email):
 @app.route("/<path:path>/view/<string:revision>")
 @app.route("/<path:path>/view")
 def pageview(path="Home", revision=None):
+    if revision is None:
+        symlink_redirect = redirect_internal_page_symlink(path)
+        if symlink_redirect is not None:
+            return symlink_redirect
+
     p = Page(path, revision=revision)
     return p.view()
 
 
 # last matching endpoint seems to be the default for url_for
-@app.route("/<path:path>")
+@app.route("/<path:path>", methods=["POST", "GET"])
 def view(path="Home"):
+    # the editor is served via the ?edit query flag so it keeps the same base
+    # url as the rendered page (POST is used by the draft handling form)
+    if "edit" in request.values:
+        if request.method == "GET":
+            symlink_redirect = redirect_internal_page_symlink(path)
+            if symlink_redirect is not None:
+                return symlink_redirect
+
+            symlink_redirect = redirect_internal_directory_symlink(path)
+            if symlink_redirect is not None:
+                return symlink_redirect
+
+        p = Page(path, revision=request.values.get("revision"))
+        return p.editor(
+            author=otterwiki.auth.get_author(),
+            handle_draft=request.form.get("draft", None),
+        )
     p = AutoRoute(path, values=request.values)
     return p.view()
 
@@ -556,6 +581,11 @@ def delete(path):
 @app.route("/<path:path>/blame", methods=["GET"])
 @app.route("/<path:path>/blame/<string:revision>", methods=["GET"])
 def blame(path, revision=None):
+    if revision is None:
+        target_pagepath = get_internal_page_symlink_target(path)
+        if target_pagepath is not None:
+            return redirect(url_for("blame", path=target_pagepath))
+
     p = Page(path, revision=revision)
     return p.blame()
 
@@ -563,6 +593,10 @@ def blame(path, revision=None):
 @app.route("/<path:path>/edit", methods=["POST", "GET"])
 @app.route("/<path:path>/edit/<string:revision>", methods=["GET"])
 def edit(path, revision=None):
+    if request.method == "GET" and revision is None:
+        target_pagepath = get_internal_page_symlink_target(path)
+        if target_pagepath is not None:
+            return redirect(url_for("view", path=target_pagepath) + "?edit")
 
     p = Page(path, revision=revision)
     return p.editor(
@@ -608,6 +642,16 @@ def draft(path):
         revision=request.form.get("revision", ""),
         author=otterwiki.auth.get_author(),
     )
+
+
+@app.route("/<path:path>/draft/discard", methods=["POST"])
+def discard_draft(path):
+    p = Page(path)
+    # only the draft of the current user is discarded
+    p.discard_draft(author=otterwiki.auth.get_author())
+    return {
+        "status": "draft discarded",
+    }
 
 
 @app.route("/<path:pagepath>/source/<string:revision>")
@@ -791,7 +835,11 @@ def pull_webhook(webhook_hash):
 @app.route("/-/plugin/<string:name>/<string:extra>", methods=["POST", "GET"])
 def plugin_url_request(name, extra):
     result = call_hook(
-        "url_request", plugin=name, extra=extra, values=request.values
+        "url_request",
+        plugin=name,
+        extra=extra,
+        method=request.method,
+        values=request.values,
     )
     if not result:
         abort(404)
@@ -805,7 +853,11 @@ def plugin_url_admin_request(name, extra):
     if not otterwiki.auth.has_permission("ADMIN"):
         abort(403)
     result = call_hook(
-        "url_admin_request", plugin=name, extra=extra, valuies=request.values
+        "url_admin_request",
+        plugin=name,
+        extra=extra,
+        method=request.method,
+        values=request.values,
     )
     if not result:
         abort(404)

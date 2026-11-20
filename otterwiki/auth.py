@@ -11,7 +11,6 @@ import flask_login
 from flask import (
     redirect,
     request,
-    url_for,
     render_template,
     abort,
     session,
@@ -26,6 +25,7 @@ from flask_login import (
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from otterwiki.helper import (
+    url_for,
     toast,
     send_mail,
     serialize,
@@ -365,8 +365,16 @@ class SimpleAuth:
             toast(f"Error: Your {name_check[1]}", "error")
         elif password1 != password2:
             toast("The passwords do not match.", "error")
-        elif password1 is None or len(password1) < 8:
-            toast("The password must be at least 8 characters long.", "error")
+        elif (
+            password1 is None
+            or len(password1) < app.config['PASSWORD_MIN_LENGTH']
+        ):
+            toast(
+                "The password must be at least {} characters long.".format(
+                    app.config['PASSWORD_MIN_LENGTH']
+                ),
+                "error",
+            )
         else:
             # register account
             self.create_user(email, name, password=password1)
@@ -389,11 +397,8 @@ class SimpleAuth:
         if user is None:
             toast("Invalid user or token.", "error")
             return redirect(url_for("login"))
-        # mark user as confirmed
+        # mark user as confirmed, notifies the admins
         self.user_confirmed_email(email)
-        # notify admins
-        if app.config['NOTIFY_ADMINS_ON_REGISTER']:
-            self.activated_user_notify_admins(user.name, email)
         # log activation
         app.logger.info(
             "auth: New user activated: {} <{}>".format(user.name, user.email)
@@ -423,9 +428,14 @@ class SimpleAuth:
         ):
             if form.get("password1") != form.get("password2"):
                 toast("The passwords do not match.", "error")
-            elif len(form.get("password1")) < 8:
+            elif (
+                len(form.get("password1")) < app.config['PASSWORD_MIN_LENGTH']
+            ):
                 toast(
-                    "The password must be at least 8 characters long.", "error"
+                    "The password must be at least {} characters long.".format(
+                        app.config['PASSWORD_MIN_LENGTH']
+                    ),
+                    "error",
                 )
             else:
                 # update password

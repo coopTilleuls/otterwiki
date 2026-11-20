@@ -67,7 +67,8 @@ var otterwiki = {
     update_mermaid: function() {
         if (typeof(mermaid) == 'undefined' || mermaid == null) { return; }
 
-        var mm_diagrams = document.getElementsByClassName('mermaid');
+        // the diagrams of the editors preview are rendered by the editor
+        var mm_diagrams = document.querySelectorAll('.mermaid:not(#preview_block .mermaid)');
         for (var i = 0; i < mm_diagrams.length; ++i) {
             mm_diagrams[i].removeAttribute('data-processed');
         }
@@ -79,13 +80,86 @@ var otterwiki = {
             console.log("Error: pre element matching the button could not found. This is a bug.")
             return;
         }
-        navigator.clipboard.writeText(pre_element.innerText);
+        var text = pre_element.innerText;
+        if (navigator.clipboard && window.isSecureContext) {
+            navigator.clipboard.writeText(text);
+        } else {
+            // Fallback for non-secure contexts (e.g. plain HTTP), where
+            // navigator.clipboard is undefined.
+            var textarea = document.createElement("textarea");
+            textarea.value = text;
+            textarea.style.position = "fixed";
+            textarea.style.opacity = "0";
+            document.body.appendChild(textarea);
+            textarea.focus();
+            textarea.select();
+            try {
+                document.execCommand("copy");
+            } catch (err) {
+                console.log("Error: copy to clipboard failed.", err);
+            }
+            document.body.removeChild(textarea);
+        }
     },
     toggle_invert_by_name: function(checkbox_name) {
         let checkboxes = document.querySelectorAll('input[name='+checkbox_name+']');
         for (let i = 0; i < checkboxes.length; i++) {
             checkboxes[i].checked = !checkboxes[i].checked;
         }
+    },
+    /*
+        unchanged lines in a side by side diff are shortened, make the
+        shortened ones expandable by click or keyboard
+    */
+    diff_expandable_context: function() {
+        const rows = document.querySelectorAll('table.diff-side-by-side tr.diff-context');
+        if (rows.length < 1) {
+            return;
+        }
+        const mark_clamped = function() {
+            rows.forEach((row) => {
+                if (row.classList.contains('expanded')) {
+                    return;
+                }
+                const clamped = [...row.querySelectorAll('.diff-clamp')].some(
+                    (div) => div.scrollHeight > div.clientHeight + 1);
+                row.classList.toggle('clamped', clamped);
+                if (clamped) {
+                    row.setAttribute('tabindex', '0');
+                    row.setAttribute('title', 'Show the full line');
+                    row.setAttribute('aria-expanded', 'false');
+                } else {
+                    row.removeAttribute('tabindex');
+                    row.removeAttribute('title');
+                    row.removeAttribute('aria-expanded');
+                }
+            });
+        };
+        const toggle = function(row) {
+            if (!row.classList.contains('clamped') && !row.classList.contains('expanded')) {
+                return;
+            }
+            const expanded = row.classList.toggle('expanded');
+            row.classList.toggle('clamped', !expanded);
+            row.setAttribute('aria-expanded', expanded);
+            row.setAttribute('title', expanded ? 'Shorten the line' : 'Show the full line');
+        };
+        rows.forEach((row) => {
+            row.addEventListener('click', () => {
+                // don't toggle while the user is selecting text
+                if (window.getSelection().toString() === '') {
+                    toggle(row);
+                }
+            });
+            row.addEventListener('keydown', (event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    toggle(row);
+                }
+            });
+        });
+        mark_clamped();
+        window.addEventListener('resize', mark_clamped);
     },
     retain_update_backlinks_checkbox: function() {
         const checkbox = document.getElementById("update_backlinks");
@@ -105,11 +179,36 @@ var otterwiki = {
 }
 
 var MathJax = {
+    loader: {
+        // Filter user-controlled TeX: \href{javascript:...} would otherwise
+        // turn into a link that runs a script on click.
+        load: ['ui/safe'],
+    },
+    startup: {
+        ready() {
+            // ui/safe checks the scheme of the raw url, but browsers drop
+            // leading control characters and tabs before they parse it.
+            // Clean the url first, so "\x01javascript:" can't get past.
+            const methods = MathJax._.ui.safe.SafeMethods.SafeMethods;
+            const filterURL = methods.filterURL;
+            methods.filterURL = (safe, url) => filterURL(
+                safe,
+                url.replace(/^[\x00-\x20]+|[\x00-\x20]+$|[\t\n\r]/g, ''),
+            );
+            MathJax.startup.defaultReady();
+        },
+    },
     tex: {
         inlineMath: [["\\(", "\\)"]],
         displayMath: [ ['\\[', '\\]'], ],
         processEscapes: true,
-    }
+    },
+    options: {
+        // Never typeset the markdown source inside the CodeMirror editor:
+        // raw math like \[ ... \] must stay as text while editing. The
+        // editor's preview lives outside .cm-editor and is still typeset.
+        ignoreHtmlClass: 'cm-editor',
+    },
 };
 
 /* Hot Keys */
@@ -285,6 +384,7 @@ window.addEventListener("keydown", function(event) {
 
 document.addEventListener("DOMContentLoaded", () => {
   otterwiki.retain_update_backlinks_checkbox();
+  otterwiki.diff_expandable_context();
 
   if (document.body.dataset.pageIndexRetainUserExpandedNodes === 'False') return;
 

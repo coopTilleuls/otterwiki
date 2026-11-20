@@ -9,7 +9,7 @@ from io import BytesIO
 from time import strftime
 from timeit import default_timer as timer
 from typing import List, cast
-from urllib.parse import unquote
+from urllib.parse import quote_from_bytes, unquote
 import textwrap
 
 import PIL.Image
@@ -21,7 +21,7 @@ from flask import (
     render_template,
     request,
     send_file,
-    url_for,
+    session,
 )
 from markupsafe import escape as html_escape
 from werkzeug.http import http_date
@@ -31,8 +31,13 @@ from feedgen.feed import FeedGenerator
 from bs4 import BeautifulSoup
 
 from otterwiki.auth import current_user, has_permission, login_manager
-from otterwiki.gitstorage import StorageError, StorageNotFound
+from otterwiki.gitstorage import (
+    StorageError,
+    StorageNotFound,
+    StorageUnsafePath,
+)
 from otterwiki.helper import (
+    url_for,
     auto_url,
     get_attachment_directoryname,
     get_breadcrumbs,
@@ -54,11 +59,12 @@ from otterwiki.plugins import (
     plugin_manager,
 )
 from otterwiki.pluginmgmt import collect_plugin_info
-from otterwiki.renderer import pygments_render
+from otterwiki.renderer import pygments_render, pygments_render_lines
 from otterwiki.server import app, app_renderer, db, storage
 from otterwiki.sidebar import SidebarMenu, SidebarPageIndex
 from otterwiki.pageindex import PageIndex
 from otterwiki.util import (
+    diff_side_by_side_html,
     empty,
     get_header,
     get_page_directoryname,
@@ -66,11 +72,14 @@ from otterwiki.util import (
     guess_mimetype,
     join_path,
     patchset2filedict,
+    sanitize_filename,
     sanitize_pagename,
     sizeof_fmt,
     split_path,
     get_PatchSet,
     int_or_None,
+    diff_content,
+    normalize_content,
 )
 
 from .backlinks import rename_backlinks
@@ -353,6 +362,10 @@ class Changelog:
         return fg.atom_str(pretty=True)
 
 
+# the views of the diff page, the first one is the default
+DIFF_VIEWS = ("inline", "side-by-side")
+
+
 class Page:
     def __init__(
         self,
@@ -444,15 +457,46 @@ class Page:
 
         return content, metadata
 
+    def _render_custom_404(self):
+        not_found_page = (app.config.get("NOT_FOUND_PAGE") or "").strip("/")
+        if not not_found_page or not_found_page.startswith("-/"):
+            return None, None
+        page = Page(not_found_page)
+        if not page.exists or page.storage_error is not None:
+            app.logger.warning(
+                "NOT_FOUND_PAGE {} does not exist".format(not_found_page)
+            )
+            return None, None
+        # send context of the page rendered to plugins
+        call_hook("page_render_context", page=page, preview=False)
+        htmlcontent, _, library_requirements = app_renderer.markdown(
+            page.content, page_url=page.page_view_url
+        )
+        htmlcontent = chain_hooks(
+            "page_view_htmlcontent_postprocess", htmlcontent, page
+        )
+        return htmlcontent, library_requirements
+
     def exists_or_404(self, in_git: bool = False):
         if not self.exists or (in_git and self.metadata is None):
             app.logger.warning("Not found {}".format(self.pagename))
+            custom_404_html, library_requirements = self._render_custom_404()
+            extra_js = ""
+            if custom_404_html:
+                extra_js = "".join(collect_hook("renderer_javascript"))
+                if len(extra_js):
+                    extra_js = (
+                        f"<script type=\"text/javascript\">{extra_js}</script>"
+                    )
             response404 = make_response(
                 render_template(
                     "page404.html",
                     title="{} - not found".format(self.pagename_full),
                     pagename=self.pagename_full,
                     pagepath=self.pagepath,
+                    custom_404_html=custom_404_html,
+                    library_requirements=library_requirements,
+                    extra_js=extra_js,
                 ),
                 404,
             )
@@ -537,7 +581,9 @@ class Page:
                 breadcrumbs=self.breadcrumbs(),
                 danger_alert=[
                     "Storage error",
-                    self.storage_error,
+                    # danger_alert[1] is rendered with |safe, the error may
+                    # contain the filename, so escape it
+                    str(html_escape(self.storage_error)),
                 ],
                 menutree=menutree.query(),
                 custom_menu=SidebarMenu().query(),
@@ -553,7 +599,7 @@ class Page:
         if not self.metadata:
             danger_alert = [
                 "Not under version control",
-                f"""This page was loaded from the repository but is not added under git version control. Make a commit on the <a href="/{self.pagepath}/edit" class="alert-link">Edit page</a> to add it.""",
+                f"""This page was loaded from the repository but is not added under git version control. Make a commit on the <a href="{url_for('edit', path=self.pagepath)}" class="alert-link">Edit page</a> to add it.""",
             ]
 
         # send context of the page rendered to plugins
@@ -719,7 +765,7 @@ class Page:
             cursor_line = 0
             cursor_ch = 0
         else:
-            content = f"# {self.pagename}\n\n"
+            content = self._new_page_content()
             # Place the cursor in the beginning of the first (empty) line of the\
             # new document
             cursor_line = 2
@@ -735,33 +781,32 @@ class Page:
                 "None" if draft is None else "found", timer() - t_start
             )
         )
+        revision = self.metadata.get("revision", "") if self.metadata else ""
         if draft is not None:
+            # the revision the draft is based on, empty for a new page
+            draft_revision = draft.revision or ""
             if handle_draft is None:
-                return render_template(
-                    "draft.html",
-                    title="{} - draft".format(self.pagename),
-                    pagename=self.pagename,
-                    pagepath=self.pagepath,
-                    revision=(
-                        self.metadata["revision"] if self.metadata else None
-                    ),
-                    draft_revision=self.revision,
-                    content=(
-                        pygments_render(self.content, lang='markdown')
-                        if self.content
-                        else None
-                    ),
-                    draft_content=pygments_render(
-                        draft.content, lang='markdown'
-                    ),
-                    draft_datetime=draft.datetime.astimezone(UTC),
+                return self._draft_overview(
+                    draft, draft_revision, self._changes_since(draft_revision)
                 )
             if handle_draft == "discard":
                 self.discard_draft(author=author)
             if handle_draft == "edit":
+                changes = self._changes_since(draft_revision)
                 content = draft.content
                 cursor_line = draft.cursor_line
                 cursor_ch = draft.cursor_ch
+                # keep the revision the draft is based on, so the draft
+                # stays marked as outdated until the page is saved
+                revision = draft_revision
+                if changes is None or len(changes) > 0:
+                    toast(
+                        "{} has been changed since the draft was started. "
+                        "Saving the draft overwrites these changes.".format(
+                            self.pagename_full
+                        ),
+                        "warning",
+                    )
 
         # get file listing
         t_start = timer()
@@ -795,11 +840,75 @@ class Page:
             pages=list(page_idx.pages()),
             cursor_line=cursor_line,
             cursor_ch=cursor_ch,
-            revision=(
-                self.metadata.get("revision", "") if self.metadata else ""
-            ),
+            revision=revision,
             force_load_libraries=True,
             embedding_info=embedding_info,
+        )
+
+    def _changes_since(self, revision):
+        """
+        Returns the commits of the page newer than revision, newest first.
+        Returns None if revision can not be found in the history of the page.
+        """
+        try:
+            log = storage.log(self.filename)
+        except StorageNotFound:
+            log = []
+        changes = []
+        for entry in log:
+            if entry["revision"] == revision:
+                return changes
+            changes.append(entry)
+        # an empty revision marks a draft of a page that didn't exist yet
+        return changes if not revision else None
+
+    def _draft_overview(self, draft, draft_revision, changes):
+        # diff the draft against the version it is based on, so the diff shows
+        # only the changes made in the draft
+        base_content = None
+        if not draft_revision:
+            base_content = self._new_page_content()
+        elif changes is not None:
+            try:
+                base_content, _ = self.load(revision=draft_revision)
+            except StorageError:
+                pass
+        # fall back to the stored version, if the base can not be loaded
+        diff_against_stored = base_content is None
+        if diff_against_stored:
+            base_content = (
+                self.content if self.exists else self._new_page_content()
+            )
+        base_content = base_content or ""
+        draft_content = draft.content or ""
+        # highlight the markdown of both versions as a whole, so e.g. code
+        # blocks are highlighted correctly, and pick the lines of the diff
+        base_html = pygments_render_lines(
+            normalize_content(base_content), "markdown"
+        )
+        draft_html = pygments_render_lines(
+            normalize_content(draft_content), "markdown"
+        )
+
+        draft_diff = diff_side_by_side_html(
+            diff_content(base_content, draft_content),
+            html_a=base_html,
+            html_b=draft_html,
+        )
+        return render_template(
+            "draft.html",
+            title="{} - draft".format(self.pagename),
+            pagename=self.pagename,
+            pagepath=self.pagepath,
+            draft_datetime=draft.datetime.astimezone(UTC),
+            draft_revision=draft_revision,
+            draft_diff=draft_diff,
+            diff_against_stored=diff_against_stored,
+            changes=changes,
+            page_exists=self.exists,
+            current_revision=(
+                self.metadata.get("revision") if self.metadata else None
+            ),
         )
 
     def save(self, content, commit, author):
@@ -814,12 +923,15 @@ class Page:
             )
 
         # store page
-        changed = storage.store(
-            filename=self.filename,
-            content=content,
-            message=commit,
-            author=author,
-        )
+        try:
+            changed = storage.store(
+                filename=self.filename,
+                content=content,
+                message=commit,
+                author=author,
+            )
+        except StorageUnsafePath as e:
+            abort(403, description=str(e))
         if not changed:
             toast("Nothing changed.", "warning")
         else:
@@ -934,13 +1046,78 @@ class Page:
         url_map = patchset2urlmap(patchset, rev_b, rev_a)
         file_diffs = patchset2filedict(patchset)
 
+        # find the metadata of both revisions in the log of the page
+        try:
+            log = storage.log(self.filename)
+        except StorageNotFound:
+            log = []
+
+        def find_index(revision):
+            for i, entry in enumerate(log):
+                if entry["revision-full"].startswith(revision):
+                    return i
+            return None
+
+        index_a, index_b = find_index(rev_a), find_index(rev_b)
+
+        # the filenames of the page at both revisions, to follow renames
+        page_filenames = {self.filename}
+        for index in (index_a, index_b):
+            if index is not None:
+                page_filenames.update(log[index]["files"])
+
+        # previous and next edit, the log is ordered newest first
+        prev_url, next_url = None, None
+        if index_a is not None and index_b is not None:
+            older, newer = max(index_a, index_b), min(index_a, index_b)
+            if older + 1 < len(log):
+                prev_url = url_for(
+                    "diff",
+                    path=self.pagepath,
+                    rev_a=log[older + 1]["revision"],
+                    rev_b=log[older]["revision"],
+                )
+            if newer > 0:
+                next_url = url_for(
+                    "diff",
+                    path=self.pagepath,
+                    rev_a=log[newer]["revision"],
+                    rev_b=log[newer - 1]["revision"],
+                )
+
+        # inline or side by side, the choice is remembered in the session
+        view = request.args.get("view")
+        if view in DIFF_VIEWS:
+            session["diff_view"] = view
+        else:
+            view = session.get("diff_view")
+            if view not in DIFF_VIEWS:
+                view = DIFF_VIEWS[0]
+        side_by_side = {}
+        if view == "side-by-side":
+            for file in patchset:
+                if file.path not in page_filenames:
+                    continue
+                urlobj = url_map[file.path]
+                side_by_side[file.path] = diff_side_by_side_html(
+                    file_diffs[file.path],
+                    html_a=self._diff_highlight(urlobj.source_file, rev_a),
+                    html_b=self._diff_highlight(urlobj.target_file, rev_b),
+                )
+
         menutree = SidebarPageIndex(self.pagepath)
         return render_template(
             "diff.html",
+            view=view,
+            side_by_side=side_by_side,
+            metadata_a=log[index_a] if index_a is not None else None,
+            metadata_b=log[index_b] if index_b is not None else None,
+            prev_url=prev_url,
+            next_url=next_url,
             title="{} - diff {} {}".format(self.pagename, rev_a, rev_b),
             pagepath=self.pagepath,
             pagename=self.pagename,
-            page_filename=self.filename,
+            page_filenames=page_filenames,
             file_diffs=file_diffs,
             patchset=patchset,
             url_map=url_map,
@@ -952,6 +1129,24 @@ class Page:
             breadcrumbs=self.breadcrumbs(),
         )
 
+    def _diff_highlight(self, filename, revision):
+        """
+        Returns the highlighted lines of a markdown file at revision, or
+        None if the file can not be highlighted line by line.
+        """
+        if filename == "/dev/null" or not filename.endswith(".md"):
+            return None
+        try:
+            content = storage.load(filename, revision=revision)
+        except StorageError:
+            return None
+        html_lines = pygments_render_lines(content, "markdown")
+        # pygments drops leading and trailing empty lines, the lines would
+        # not match the line numbers of the diff anymore
+        if len(html_lines) != len(content.splitlines()):
+            return None
+        return html_lines
+
     def history(self, rev_a: str | None = None, rev_b: str | None = None):
         if not has_permission("READ"):
             if not current_user.is_authenticated:
@@ -962,10 +1157,26 @@ class Page:
 
         orig_log = storage.log(self.filename)
 
-        if rev_a is not None and rev_b is not None and rev_a != rev_b:
-            return redirect(
-                url_for("diff", path=self.pagepath, rev_a=rev_a, rev_b=rev_b)
-            )
+        if request.method == "POST":
+            if rev_a is None or rev_b is None:
+                toast("Please select two revisions to compare.", "warning")
+            elif rev_a == rev_b:
+                toast("Please select two different revisions.", "warning")
+            else:
+                # the log is ordered newest first, make sure rev_a is the
+                # older revision, so that the diff shows old -> new
+                revisions = [str(entry['revision']) for entry in orig_log]
+                if (
+                    rev_a in revisions
+                    and rev_b in revisions
+                    and revisions.index(rev_a) < revisions.index(rev_b)
+                ):
+                    rev_a, rev_b = rev_b, rev_a
+                return redirect(
+                    url_for(
+                        "diff", path=self.pagepath, rev_a=rev_a, rev_b=rev_b
+                    )
+                )
 
         log = []
         for i, orig_entry in enumerate(orig_log):
@@ -1044,6 +1255,7 @@ class Page:
                     message=message,
                     author=author,
                     no_commit=True,
+                    preserve_symlink_target=True,
                 )
                 changed_files.append(new_filename)
 
@@ -1209,7 +1421,14 @@ class Page:
         if maximum:
             files = files[:maximum]
         # currently only attached files are handled
-        return [Attachment(self.pagepath, f) for f in files]
+        attachments = []
+        for f in files:
+            try:
+                attachments.append(Attachment(self.pagepath, f))
+            except StorageError as e:
+                # e.g. a symlink pointing outside the repository
+                app.logger.warning(f"Skipping attachment: {e}")
+        return attachments
 
     def _attachments_list(self):
         files = [
@@ -1253,10 +1472,15 @@ class Page:
                 # no file selected
                 continue
             if not empty(filename):
-                fn = secure_filename(filename)
+                fn = sanitize_filename(filename) or secure_filename(filename)
             else:
-                fn = secure_filename(upload.filename)
+                fn = sanitize_filename(upload.filename) or secure_filename(
+                    upload.filename
+                )
             attachment = Attachment(self.pagepath, fn)
+            # reject a path resolving into .git, e.g. via a symlinked
+            # attachment directory pushed via git
+            storage._abspath(attachment.filepath)
             # make sure the directory exists
             os.makedirs(attachment.absdirectory, mode=0o775, exist_ok=True)
             upload.save(attachment.abspath)
@@ -1323,6 +1547,9 @@ class Page:
         if not empty(new_filename):
             if not has_permission("WRITE"):
                 return abort(403)
+            new_filename = sanitize_filename(new_filename) or secure_filename(
+                new_filename
+            )
             if new_filename != filename:
                 return a.rename(new_filename, message=message, author=author)
         # show edit form
@@ -1363,11 +1590,26 @@ class Page:
         ).delete()
         db.session.commit()
 
+    def _new_page_content(self):
+        return f"# {self.pagename}\n\n"
+
     def save_draft(
         self, author, content, revision="", cursor_line=0, cursor_ch=0
     ):
         if not has_permission("WRITE"):
             abort(403)
+        # a draft without changes is no draft, e.g. when the user reverted
+        # all changes, compare normalized like in views.save()
+        stored_content = (
+            self.content if self.exists else self._new_page_content()
+        )
+        if stored_content is not None and normalize_content(
+            content
+        ) == normalize_content(stored_content):
+            self.discard_draft(author)
+            return {
+                "status": "draft discarded",
+            }
         # Handle anonymous users, save draft in session
         if current_user.is_anonymous:
             author_email = current_user.anonymous_uid()
@@ -1395,6 +1637,30 @@ class Page:
         return {
             "status": "draft saved",
         }
+
+
+# Attachments are user supplied and served from the wiki origin. The sandbox
+# keeps any script inside them (e.g. an HTML or SVG file opened directly)
+# from running in that origin. Images embedded via <img> are not affected.
+ATTACHMENT_CSP = (
+    "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:"
+)
+# Browsers refuse to render PDFs or play media in a sandboxed document. These
+# types can not execute script in the wiki origin, so they skip the CSP.
+ATTACHMENT_CSP_EXEMPT_PREFIXES = ("application/pdf", "video/", "audio/")
+# Document types that browsers render as active content. They are never
+# rendered inline, but downloaded instead.
+ATTACHMENT_FORCE_DOWNLOAD = {
+    "text/html",
+    "application/xhtml+xml",
+    "application/xml",
+    "text/xml",
+    "text/xsl",
+    "application/xslt+xml",
+    "application/mathml+xml",
+    "application/rdf+xml",
+    "application/vnd.mozilla.xul+xml",
+}
 
 
 class Attachment:
@@ -1449,7 +1715,8 @@ class Attachment:
             self._revision = None
 
     def exists(self):
-        return os.path.exists(self.abspath)
+        # storage.exists rejects unsafe paths, e.g. anything in .git
+        return storage.exists(self.filepath)
 
     def get_thumbnail_url(self):
         if self.mimetype is not None and self.mimetype.startswith("image"):
@@ -1580,11 +1847,19 @@ class Attachment:
             if not current_user.is_authenticated:
                 return redirect(url_for("login", next=request.full_path))
             abort(403)
+        # active document types are downloaded instead of rendered inline
+        as_attachment = self.mimetype in ATTACHMENT_FORCE_DOWNLOAD
         if self.revision is None:
             if not storage.exists(self.filepath):
                 return abort(404)
             # headers are already set correctly by send_file
-            response = make_response(send_file(self.abspath))
+            response = make_response(
+                send_file(
+                    self.abspath,
+                    as_attachment=as_attachment,
+                    download_name=self.filename,
+                )
+            )
         else:
             # revision is given
             try:
@@ -1607,7 +1882,10 @@ class Attachment:
             # create response
             response = make_response(
                 send_file(
-                    buffer, mimetype=self.mimetype, download_name=self.filename
+                    buffer,
+                    mimetype=self.mimetype,
+                    as_attachment=as_attachment,
+                    download_name=self.filename,
                 )
             )
             # set header, caching, etc
@@ -1615,6 +1893,12 @@ class Attachment:
             response.headers["Cache-Control"] = "max-age=604800, immutable"
             response.headers["Date"] = http_date(datetime.now(UTC))
 
+        return self._harden_response(response)
+
+    def _harden_response(self, response):
+        mimetype = self.mimetype or "application/octet-stream"
+        if not mimetype.startswith(ATTACHMENT_CSP_EXEMPT_PREFIXES):
+            response.headers["Content-Security-Policy"] = ATTACHMENT_CSP
         return response
 
     def get_thumbnail(self, size=80, width=None, height=None):
@@ -1697,7 +1981,7 @@ class Attachment:
         response.headers["Last-Modified"] = http_date(
             self.datetime.astimezone(UTC)
         )
-        return response
+        return self._harden_response(response)
 
 
 class Search:
@@ -1823,7 +2107,8 @@ class Search:
                 n,
                 fn,
                 get_pagename(fn, full=True),
-                get_pagename(fn, full=True),
+                # key[4] is rendered with |safe, so escape the pagename
+                str(html_escape(get_pagename(fn, full=True))),
             ]
             summary = []
             if fnmatch == 1:
@@ -1908,6 +2193,120 @@ class Search:
         )
 
 
+def _internal_symlink_redirect_allowed():
+    # Do not disclose the symlink target to users who cannot read the wiki.
+    if not has_permission("READ"):
+        return False
+
+    # Historical revisions belong to the alias, not its current target.
+    if "revision" in request.values:
+        return False
+
+    return True
+
+
+def get_internal_page_symlink_target(path):
+    if not _internal_symlink_redirect_allowed():
+        return None
+
+    # Match the filename used by Page(path) before resolving a symlink.
+    filename = get_filename(sanitize_pagename(path, handle_md=True))
+
+    if not storage.exists(filename):
+        return None
+
+    canonical_filename = storage.canonical_filename(filename)
+
+    if canonical_filename == filename:
+        return None
+
+    # Only page symlinks are redirected. Attachments and directories keep
+    # their existing behaviour.
+    if not canonical_filename.endswith(".md") or storage.isdir(
+        canonical_filename
+    ):
+        return None
+
+    target_pagepath = get_pagename(canonical_filename, full=True)
+
+    # When page names are normalized for storage, only redirect if the URL
+    # maps back to the exact canonical filename. Otherwise the redirect could
+    # turn a working symlink into a broken page on case-sensitive filesystems.
+    if get_filename(target_pagepath) != canonical_filename:
+        return None
+
+    return target_pagepath
+
+
+def _redirect_internal_symlink_target(target_pagepath):
+    if target_pagepath is None:
+        return None
+
+    target_url = url_for("view", path=target_pagepath)
+
+    if request.query_string:
+        # Preserve the original bytes without decoding possibly invalid UTF-8.
+        target_url += "?" + quote_from_bytes(
+            request.query_string, safe="%!$&'()*+,/:;=?@"
+        )
+
+    return redirect(target_url)
+
+
+def redirect_internal_page_symlink(path):
+    return _redirect_internal_symlink_target(
+        get_internal_page_symlink_target(path)
+    )
+
+
+def get_internal_directory_symlink_target(path):
+    if not _internal_symlink_redirect_allowed():
+        return None
+
+    normalized_path = sanitize_pagename(path, handle_md=True)
+    if not normalized_path:
+        return None
+
+    filename = get_filename(normalized_path)
+
+    # A page at this path takes precedence over a directory, matching
+    # AutoRoute's existing page/directory behaviour.
+    if storage.exists(filename):
+        return None
+
+    directoryname = get_attachment_directoryname(filename)
+    if not storage.exists(directoryname) or not storage.isdir(directoryname):
+        return None
+
+    canonical_directory = storage.canonical_filename(directoryname)
+
+    # Ordinary directories and allowed external symlinks keep their existing
+    # behaviour. Only internal directory symlinks need a canonical redirect.
+    if canonical_directory == directoryname or not storage.isdir(
+        canonical_directory
+    ):
+        return None
+
+    target_pagepath = get_pagename(canonical_directory, full=True)
+
+    # Only redirect if Otter's normal URL -> storage mapping reaches the
+    # exact canonical directory. Otherwise the redirect could break a working
+    # symlink on case-sensitive filesystems.
+    normalized_directory = get_attachment_directoryname(
+        get_filename(target_pagepath)
+    )
+    if normalized_directory != canonical_directory:
+        return None
+
+    return target_pagepath
+
+
+def redirect_internal_directory_symlink(path):
+    return _redirect_internal_symlink_target(
+        get_internal_directory_symlink_target(path)
+    )
+
+
 class AutoRoute:
     def __init__(self, path, values={}):
         self.path = path
@@ -1968,6 +2367,16 @@ class AutoRoute:
             # if any of these are set the image should be scaled via the get_attachment_thumbnail function
             # this is an attachment
             return p.get_attachment(self.filename)
+
+        if request.method == "GET":
+            symlink_redirect = redirect_internal_page_symlink(self.path)
+            if symlink_redirect is not None:
+                return symlink_redirect
+
+            symlink_redirect = redirect_internal_directory_symlink(self.path)
+            if symlink_redirect is not None:
+                return symlink_redirect
+
         try:
             revision = self.values['revision']
         except KeyError:

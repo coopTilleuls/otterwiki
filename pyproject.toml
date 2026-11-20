@@ -5,22 +5,23 @@ authors = [
     { name = "Ralph Thesen", email = "mail@redimp.de" }
     ]
 readme = "README.md"
-license = {file = "LICENSE"}
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dynamic = ["version"]
 dependencies = [
-    "Werkzeug==3.1.6",
+    "Werkzeug==3.1.9",
     "Flask-Login==0.6.3",
     "Flask-Mail==0.10.0",
     "SQLAlchemy==2.0.36",
     "Flask-SQLAlchemy==3.1.1",
     "Flask==3.1.3",
     "Jinja2==3.1.6",
-    "gitpython==3.1.57",
+    "gitpython==3.2.1",
     "cython==3.0.11",
     "mistune==3.3.3",
     "pygments==2.20.0",
-    "Pillow==12.3.0",
+    "Pillow==13.0.0",
     "PyYAML==6.0.2",
     "unidiff==0.7.5",
     "beautifulsoup4==4.12.3",
@@ -35,7 +36,6 @@ dependencies = [
 keywords = ["wiki", "git", "markdown"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
     "Topic :: Internet :: WWW/HTTP :: Dynamic Content :: Wiki",
@@ -66,13 +66,13 @@ dev = [
 
 [build-system]
 requires = [
-    "setuptools",
+    "setuptools>=77",
     "wheel",
 ]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-packages = ["otterwiki"]
+[tool.setuptools.packages.find]
+include = ["otterwiki*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "otterwiki.version.__version__"}
@@ -102,6 +102,8 @@ testpaths = ["./tests", "./docs/plugin_examples/tests"]
 filterwarnings = [
     # venv/lib/python3.12/site-packages/flask_login/login_manager.py:488: DeprecationWarning: datetime.datetime.utcnow() is deprecated
     "ignore: datetime.datetime.utcnow\\(\\) is deprecated:DeprecationWarning",
+    # bs4 warns when rendered html looks like a filename or url
+    "ignore::bs4.MarkupResemblesLocatorWarning",
 ]
 
 [tool.pyright]

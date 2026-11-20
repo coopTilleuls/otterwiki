@@ -22,7 +22,9 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       labels:
-        {{- include "otterwiki.selectorLabels" . | nindent 8 }}
+        {{- $selectorLabels := include "otterwiki.selectorLabels" . | fromYaml }}
+        {{- $podLabels := .Values.podLabelsAdditional | default dict }}
+        {{- toYaml (merge $selectorLabels $podLabels) | nindent 8 }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:

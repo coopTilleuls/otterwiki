@@ -4,7 +4,9 @@
 import re
 import mistune
 import urllib.parse
+from html import unescape
 from bs4 import BeautifulSoup
+from bs4.element import Comment, PreformattedString
 from markupsafe import Markup, escape
 from mistune.plugins.formatting import strikethrough as plugin_strikethrough
 from mistune.plugins.table import table as plugin_table, table_in_list
@@ -90,6 +92,20 @@ def pygments_render(code, lang, linenumbers=False):
     return html
 
 
+def pygments_render_lines(code, lang):
+    """
+    Highlight code and return the html of each line. The spans pygments
+    creates are closed at the end of each line, so the lines can be used
+    on their own, e.g. in a diff.
+    """
+    try:
+        lexer = get_lexer_by_name(lang.strip(), stripall=False)
+    except ClassNotFound:
+        return [str(escape(line)) for line in code.splitlines()]
+    html = highlight(code, lexer, HtmlFormatter(nowrap=True))
+    return html.splitlines()
+
+
 def hidemagicword(text):
     arr = text.splitlines(True)
     for n, line in enumerate(arr):
@@ -141,6 +157,125 @@ def parse_custom_allowlist(custom_allowlist: str = None) -> tuple:
     return custom_tags, custom_attributes
 
 
+# attributes that carry an url and must be checked against the
+# allowlist of protocols
+URL_ATTRIBUTES = [
+    'href',
+    'src',
+    'poster',
+    'action',
+    'formaction',
+    'data',
+    'background',
+    'xlink:href',
+]
+
+# protocols that must never be reached from an attribute, neither from an
+# url attribute nor from an url() inside a style attribute
+DANGEROUS_PROTOCOLS = [
+    'javascript:',
+    'data:',
+    'vbscript:',
+    'file:',
+    'about:',
+]
+
+# css constructs that run script or pull in a stylesheet. expression() and
+# behavior: are only understood by ancient browsers, -moz-binding: by old
+# geckos, but they cost nothing to reject.
+DANGEROUS_CSS = [
+    'expression(',
+    'behavior:',
+    '-moz-binding:',
+    '@import',
+]
+
+# control characters and whitespace: browsers strip TAB, LF and CR from
+# urls (and ignore leading/trailing control characters) before resolving
+# the protocol, so "jav&#x09;ascript:" is executed as "javascript:".
+_URL_STRIP_RE = re.compile(r"[\x00-\x20\x7f]")
+
+# css comments may appear in the middle of a value, e.g. "expr/**/ession("
+_CSS_COMMENT_RE = re.compile(r"/\*.*?(?:\*/|$)", re.S)
+
+# css escapes: "\6a" (optionally followed by one whitespace) or "\<char>",
+# browsers decode both before they interpret the value, so
+# "url(\6a avascript:alert(1))" resolves to "url(javascript:alert(1))"
+_CSS_ESCAPE_RE = re.compile(r"\\([0-9a-fA-F]{1,6})[ \t\r\n\f]?|\\(.)", re.S)
+
+# the target of an url(), quoted or bare
+_CSS_URL_RE = re.compile(
+    r"url\([ \t\r\n\f]*(?:\"([^\"]*)\"|'([^']*)'|([^)]*))",
+    re.I,
+)
+
+
+def normalize_url_for_protocol_check(value: str) -> str:
+    """
+    Normalize an attribute value the way a browser does before it resolves
+    the protocol of an url: decode html entities, drop control characters
+    and whitespace, lowercase.
+
+    BeautifulSoup already decodes entities while parsing, the additional
+    unescape() guards against values that carry another layer of encoding.
+    """
+    # decode entities the parser may have left behind, e.g. "&amp;#106;"
+    decoded = unescape(value)
+    if decoded != value:
+        # one more pass, in case of nested encoding
+        decoded = unescape(decoded)
+    return _URL_STRIP_RE.sub("", decoded).lower()
+
+
+def _decode_css_escapes(value: str) -> str:
+    def replace(m):
+        if m.group(1) is not None:
+            try:
+                return chr(int(m.group(1), 16))
+            except ValueError:
+                return ""
+        return m.group(2)
+
+    return _CSS_ESCAPE_RE.sub(replace, value)
+
+
+def is_dangerous_style(value: str) -> bool:
+    """
+    Check the value of a style attribute the way a browser reads it: decode
+    html entities and css escapes, drop css comments, then reject script
+    constructs and url()s that carry a dangerous protocol.
+    """
+    # every step below is guarded by a substring check: an ordinary style
+    # value like "color:red" carries no entity, escape, comment or url() and
+    # must not pay for a regex pass that cannot match anything
+    decoded = value
+    if "&" in decoded:
+        # BeautifulSoup decoded the entities, the extra pass guards against
+        # another layer of encoding, as it does for url attributes
+        decoded = unescape(decoded)
+        if "&" in decoded:
+            decoded = unescape(decoded)
+    if "\\" in decoded:
+        decoded = _decode_css_escapes(decoded)
+    # after decoding the escapes, "\2f\2a" has become a comment opener
+    if "/*" in decoded:
+        decoded = _CSS_COMMENT_RE.sub("", decoded)
+
+    # css ignores whitespace between the parts of a declaration
+    stripped = _URL_STRIP_RE.sub("", decoded).lower()
+    if any(construct in stripped for construct in DANGEROUS_CSS):
+        return True
+
+    if "url(" in stripped:
+        for match in _CSS_URL_RE.finditer(decoded):
+            url = match.group(1) or match.group(2) or match.group(3) or ""
+            normalized = normalize_url_for_protocol_check(url)
+            if normalized.startswith(tuple(DANGEROUS_PROTOCOLS)):
+                return True
+
+    return False
+
+
 def clean_html(
     html: str, custom_tags: list = None, custom_attributes: dict = None
 ) -> str:
@@ -151,6 +286,7 @@ def clean_html(
     - Event handlers (onclick, onload, onbegin, etc.)
     - Dangerous protocols (javascript:, data:)
     - Dangerous tags (object, embed, iframe, svg with events, etc.)
+    - Dangerous css in style attributes (url(javascript:), expression(), ...)
     """
 
     # tags and attrs are logically groupped by types
@@ -190,14 +326,6 @@ def clean_html(
     }
     # fmt: on
 
-    DANGEROUS_PROTOCOLS = [
-        'javascript:',
-        'data:',
-        'vbscript:',
-        'file:',
-        'about:',
-    ]
-
     # extend with custom user-defined tags and attributes
     if custom_tags:
         for tag_name in custom_tags:
@@ -216,7 +344,20 @@ def clean_html(
     soup = BeautifulSoup(html, 'html.parser')
     _escape = False
 
-    for element in soup.find_all(True):
+    # html is returned verbatim, so constructs where html.parser and the
+    # browser may disagree must not pass: cdata, doctype, declarations and
+    # processing instructions are never needed, comments only when they
+    # contain no angle brackets (e.g. <!--><script>..</script>-->)
+    for node in soup.descendants:
+        if type(node) is Comment:
+            if '<' in node or '>' in node:
+                _escape = True
+                break
+        elif isinstance(node, PreformattedString):
+            _escape = True
+            break
+
+    for element in [] if _escape else soup.find_all(True):
         if not hasattr(element, 'name') or element.name is None:
             continue
 
@@ -237,13 +378,20 @@ def clean_html(
                     _escape = True
                     break
 
-                if attr_name_lower in ['href', 'src', 'poster']:
+                if attr_name_lower in URL_ATTRIBUTES:
                     if isinstance(attr_value, str):
-                        attr_lower = attr_value.lower().strip()
+                        attr_normalized = normalize_url_for_protocol_check(
+                            attr_value
+                        )
                         for protocol in DANGEROUS_PROTOCOLS:
-                            if attr_lower.startswith(protocol):
+                            if attr_normalized.startswith(protocol):
                                 _escape = True
                                 break
+                elif attr_name_lower == 'style':
+                    if isinstance(attr_value, str) and is_dangerous_style(
+                        attr_value
+                    ):
+                        _escape = True
 
                 if _escape:
                     break
@@ -264,6 +412,11 @@ class OtterwikiMdRenderer(mistune.HTMLRenderer):
     toc_anchors = {}
 
     def __init__(self, env, custom_allowlist=None, *args, **kwargs):
+        # escape=False: html entities in text (e.g. &middot;, &#183;) must
+        # pass through untouched so the browser renders them; actual html
+        # tags are separate inline_html/block_html tokens and stay guarded
+        # by clean_html
+        kwargs.setdefault("escape", False)
         super().__init__(*args, **kwargs)
         self.env = env
         self.custom_tags, self.custom_attributes = parse_custom_allowlist(
@@ -393,7 +546,10 @@ class OtterwikiMdRenderer(mistune.HTMLRenderer):
             if hasattr(self, 'renderer'):
                 self.renderer.requires_mathjax = True
             html = "".join(
-                ["\\[{}\\]".format(line) for line in code.strip().splitlines()]
+                [
+                    "\\[{}\\]".format(mistune.escape(line, quote=False))
+                    for line in code.strip().splitlines()
+                ]
             )
         elif info == "mermaid":
             # mark that Mermaid is required
@@ -406,9 +562,7 @@ class OtterwikiMdRenderer(mistune.HTMLRenderer):
             )
             return html
         else:
-            html = prefix + pygments_render(
-                code, info, linenumbers=linenumbers
-            )
+            html = pygments_render(code, info, linenumbers=linenumbers)
         html = showmagicword(cursorline, html)
         return prefix + html
 
@@ -443,8 +597,6 @@ class OtterwikiMdRenderer(mistune.HTMLRenderer):
 
 
 class OtterwikiBlockParser(mistune.BlockParser):
-    INDENT_CODE = re.compile(r'((?:\n*)(?:(?: {4}| *\t)[^\n]+\n*)+)\n')
-
     # Pattern to detect alert syntax in the first line of a blockquote
     _ALERT_DETECT = re.compile(
         r'\s*\[!(?:' + mistunePluginAlerts.TYPES_WITH_PIPES + r')\]',
@@ -500,18 +652,24 @@ class OtterwikiBlockParser(mistune.BlockParser):
 
     def parse_indent_code(self, m, state):
         """
-        Overrides mistunes rendering, since mistune catches one \\n too much.
-        Re-match the v3 scanner's group(0) against our custom INDENT_CODE regex
-        so that group(1) strips the extra trailing blank-line newlines exactly
-        as v2 did.
+        Overrides mistunes rendering to match the v2 convention of keeping a
+        single trailing newline on indented code blocks.
+
+        mistune v3 strips all surrounding blank lines via ``code.strip('\\n')``.
+        We instead strip only leading blank lines and a single trailing
+        newline, which matches the v2 convention (#212) while correctly
+        preserving blank lines *inside* the block (#566). Using mistune's full
+        scanner match (``m.group(0)``) instead of a custom regex avoids
+        truncating the block at whitespace-only lines.
         """
-        m2 = self.INDENT_CODE.match(m.group(0))
-        raw = m2.group(1) if m2 else m.group(0)
+        raw = m.group(0)
         text = mistune.block_parser.expand_leading_tab(raw)
         code = mistune.block_parser._INDENT_CODE_TRIM.sub(  # pyright: ignore
             '', text
         )
         code = code.lstrip('\n')
+        if code.endswith('\n'):
+            code = code[:-1]
         state.append_token(
             {"type": "block_code", "raw": code, "style": "indent"}
         )
@@ -697,23 +855,23 @@ class OtterwikiRenderer:
             lines = html.splitlines(True)
             for i, line in enumerate(lines):
                 if cursormagicword in line:
-                    # parse with bs4
-                    soup = BeautifulSoup(line, 'html.parser')
-                    prepend_cursor = False
-                    for element in soup.find_all():
-                        for attr_key, attr_value in element.attrs.items():
-                            if cursormagicword in attr_value:
-                                prepend_cursor = True
-                                # remove cursormagicword from attr
-                                element.attrs[attr_key] = attr_value.replace(
-                                    cursormagicword, ""
-                                )
-                        if prepend_cursor:
-                            element.insert_before(cursormagicword)
-                    # only use the bs4 string if it has been used
-                    if prepend_cursor:
-                        line = str(soup)
-                    lines[i] = line.replace(cursormagicword, self.htmlcursor)
+                    # the magic word can end up inside a tag, e.g. in the
+                    # href of an autolink. Remove it everywhere and place
+                    # the cursor in front of that tag. The line is not
+                    # re-serialized, since it may hold unbalanced tags.
+                    tag = re.compile(r"<[^<>]*" + cursormagicword + r"[^<>]*>")
+                    if tag.search(line):
+                        line = tag.sub(
+                            lambda m: self.htmlcursor + m.group(0),
+                            line,
+                            count=1,
+                        )
+                        line = line.replace(cursormagicword, "")
+                    else:
+                        line = line.replace(
+                            cursormagicword, self.htmlcursor, 1
+                        )
+                    lines[i] = line
                     # dont check other lines, there is only one cursor.
                     break
 

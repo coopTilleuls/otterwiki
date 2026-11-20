@@ -1,13 +1,19 @@
 #!/usr/bin/env python
 # vim: set et ts=8 sts=4 sw=4 ai:
 
+import html as html_module
+import re
+
 import pytest
 from bs4 import BeautifulSoup
+from markupsafe import escape
 from otterwiki.renderer import (
     render,
     clean_html,
+    is_dangerous_style,
     OtterwikiRenderer,
     pygments_render,
+    pygments_render_lines,
 )
 
 
@@ -376,6 +382,26 @@ def test_clean_html_nested_xss():
     assert '&lt;iframe' in result
 
 
+def test_clean_html_parser_differential():
+    # constructs html.parser reads as non-tag nodes, but browsers
+    # parse as a bogus or empty comment followed by a live <script>
+    for vector in [
+        '<![CDATA[><script>alert(1)</script>]]>',
+        '<!--><script>alert(1)</script>-->',
+        '<!---><script>alert(1)</script>-->',
+        '<?x><script>alert(1)</script>?>',
+        '<!DOCTYPE x><script>alert(1)</script>',
+        '<!x><script>alert(1)</script>',
+    ]:
+        result = clean_html(vector)
+        assert '<script' not in result, vector
+        html, _, _ = render.markdown(vector)
+        assert '<script' not in html, vector
+    # harmless comments still pass
+    assert clean_html('<!-- note -->') == '<!-- note -->'
+    assert clean_html('<p>a</p><!-- b -->') == '<p>a</p><!-- b -->'
+
+
 def test_clean_html_script():
     assert clean_html("<script>") == "&lt;script&gt;"
     assert (
@@ -447,6 +473,70 @@ def test_clean_html_xss_vectors():
         clean_html('<iframe srcdoc="<script>alert(9)</script>"></iframe>')
         == '&lt;iframe srcdoc=&#34;&lt;script&gt;alert(9)&lt;/script&gt;&#34;&gt;&lt;/iframe&gt;'
     )
+
+
+def test_clean_html_entity_encoded_protocol():
+    """Dangerous protocols obfuscated with html entities must be blocked.
+
+    BeautifulSoup decodes the entities while parsing, so "jav&#x09;ascript:"
+    arrives as "jav\tascript:" which does not literally start with
+    "javascript:". Browsers strip TAB, LF and CR from urls before resolving
+    the protocol and would execute the payload.
+    """
+    vectors = [
+        # tab, line feed and carriage return, entity encoded
+        '<a href="jav&#x09;ascript:alert(1)">clickme</a>',
+        '<a href="java&#10;script:alert(1)">clickme</a>',
+        '<a href="java&#13;script:alert(1)">clickme</a>',
+        # ... and as raw control characters
+        '<a href="jav\tascript:alert(1)">clickme</a>',
+        '<a href="java\nscript:alert(1)">clickme</a>',
+        # leading (encoded) whitespace and control characters
+        '<a href="&#x20;&#x09;javascript:alert(1)">clickme</a>',
+        '<a href="\x01javascript:alert(1)">clickme</a>',
+        # entity encoded characters of the protocol itself
+        '<a href="&#x6a;avascript:alert(1)">clickme</a>',
+        '<a href="javascript&colon;alert(1)">clickme</a>',
+        # double encoded
+        '<a href="&amp;#106;avascript:alert(1)">clickme</a>',
+        # other dangerous protocols
+        '<a href="da&#9;ta:text/html,<script>alert(1)</script>">clickme</a>',
+        '<a href="vb&#9;script:alert(1)">clickme</a>',
+        # and on other url carrying attributes
+        '<img src="jav&#x09;ascript:alert(1)">',
+        '<video poster="jav&#x09;ascript:alert(1)"></video>',
+    ]
+    for vector in vectors:
+        result = clean_html(vector)
+        assert result != vector, f"not escaped: {vector}"
+        assert '&lt;' in result, f"not escaped: {vector}"
+
+
+def test_clean_html_entity_encoded_protocol_in_custom_allowlist():
+    """The obfuscated protocols must be blocked on custom allowed tags, too."""
+    from otterwiki.renderer import parse_custom_allowlist
+
+    custom_tags, custom_attributes = parse_custom_allowlist(
+        'iframe[src width height]'
+    )
+    vector = '<iframe src="jav&#x09;ascript:alert(1)"></iframe>'
+    result = clean_html(
+        vector,
+        custom_tags=custom_tags,
+        custom_attributes=custom_attributes,
+    )
+    assert '&lt;iframe' in result
+
+
+def test_markdown_entity_encoded_protocol():
+    """End to end: the payload must not survive the rendering of a page."""
+    md = '<a href="jav&#x09;ascript:document.title=\'XSS-EXEC\'">clickme</a>'
+    html, _, _ = render.markdown(md)
+    # neither entity encoded nor decoded the link must be rendered as html
+    assert '<a href=' not in html
+    assert '&lt;a href=' in html
+    soup = BeautifulSoup(html, 'html.parser')
+    assert soup.find('a') is None
 
 
 def test_clean_html_allowed_tags():
@@ -663,6 +753,21 @@ c=d
     assert "\\[a=b\\]" in html
     assert "\\[c=d\\]" in html
     assert "\\[a^2+b^2=c^2\\]" in html
+
+
+def test_math_block_escapes_html():
+    md = """
+```math
+</div></article><script>alert(document.domain)</script>
+</div><img src=x onerror=alert(document.domain)>
+a &= b < c
+```
+"""
+    html, _, _ = render.markdown(md)
+    assert "<script" not in html
+    assert "<img" not in html
+    assert "&lt;script&gt;alert(document.domain)&lt;/script&gt;" in html
+    assert "\\[a &amp;= b &lt; c\\]" in html
 
 
 def test_math_code_inline():
@@ -1250,6 +1355,21 @@ This is regular."""
     assert """This is preformatted.\n""" == pre.text
 
 
+def test_indent_preformatted_blank_lines_issue566():
+    # blank lines inside an indented code block must not truncate it,
+    # regardless of whether the blank line is empty or contains 4 spaces.
+    for blank in ("", "    "):
+        md = (
+            "# t\n\nSome text.\n\n"
+            "    some_code()\n" + blank + "\n    some_more_code()\n\n"
+            "Some more text."
+        )
+        html, _, _ = render.markdown(md)
+        pre = BeautifulSoup(html, "html.parser").find('pre')
+        assert pre
+        assert "some_code()\n\nsome_more_code()\n" == pre.text
+
+
 def test_nested_list():
     md = """# Nested lists
 1. A
@@ -1708,3 +1828,268 @@ def test_frontmatter_body_no_xss():
     html, _, _ = render.markdown(md)
     _assert_no_event_handlers(html)
     assert "<img" not in html
+
+
+#
+# html entities are rendered as characters (escape=False), these tests make
+# sure that this does not open a way to inject script or to obfuscate a
+# dangerous protocol
+#
+
+_ENTITY_XSS_PAYLOADS = [
+    # entity encoded tags must stay text
+    "&lt;script&gt;alert(1)&lt;/script&gt;",
+    "&#60;script&#62;alert(1)&#60;/script&#62;",
+    "&#x3c;script&#x3e;alert(1)&#x3c;/script&#x3e;",
+    "&#60;&#115;&#99;&#114;&#105;&#112;&#116;&#62;alert(1)",
+    "&#X3C;SCRIPT&#X3E;alert(1)&#X3C;/SCRIPT&#X3E;",
+    "&amp;lt;script&amp;gt;alert(1)&amp;lt;/script&amp;gt;",
+    "&lt;img src=x onerror=alert(1)&gt;",
+    "&#60;img src=x onerror=alert(1)&#62;",
+    "&NewLine;&lt;script&gt;alert(1)&lt;/script&gt;",
+    "&#0;&lt;script&gt;alert(1)&lt;/script&gt;",
+    "&#xD800;&lt;img src=x onerror=alert(1)&gt;",
+    "&#x110000;&lt;img src=x onerror=alert(1)&gt;",
+    # entities must not break out of attributes of allowed raw html
+    '<span title="a&quot; onmouseover=&quot;alert(1)">x</span>',
+    "<span title='a&#39; onmouseover=&#39;alert(1)'>x</span>",
+    '<span class="a&quot;onclick=&quot;alert(1)">x</span>',
+    '<span title="a&gt;&lt;script&gt;alert(1)&lt;/script&gt;">x</span>',
+    '<span title="a">&#34; onmouseover=&#34;alert(1)</span>',
+    '<span class="a">&#39; onmouseover=&#39;alert(1)</span>',
+    '<span title="a&#10;onclick=alert(1)">x</span>',
+    "<span>&#x0;<img src=x onerror=alert(1)></span>",
+    "<div>\n\n&#60;img src=x onerror=alert(1)&#62;\n\n</div>",
+    # entity obfuscated protocols
+    "[click](&#106;avascript:alert(1))",
+    "[click](java&#115;cript:alert(1))",
+    "[click](jav&#x09;ascript:alert(1))",
+    "[click](javascript&colon;alert(1))",
+    "[click](&#x6a;&#x61;&#x76;&#x61;&#x73;&#x63;&#x72;&#x69;&#x70;&#x74;&#x3a;alert(1))",
+    "![alt](&#106;avascript:alert(1))",
+    "<java&#115;cript:alert(1)>",
+    '<a href="&#106;avascript:alert(1)">x</a>',
+    '<a href="&amp;#106;avascript:alert(1)">x</a>',
+    '<a href="&#10;javascript:alert(1)">x</a>',
+    '<img src="jav&#x0A;ascript:alert(1)">',
+    '<video poster="jav&#9;ascript:alert(1)" controls></video>',
+    "[[java&#115;cript:alert(1)|x]]",
+    # entities in inline text that ends up in an attribute
+    '[a&quot; onmouseover=&quot;alert(1)](http://example.com)',
+    "[a&#39; onmouseover=&#39;alert(1)](http://example.com)",
+    '![a&quot; onerror=&quot;alert(1)](http://example.com/y.png)',
+    "![a&#39; onerror=&#39;alert(1)](http://example.com/y.png)",
+    '![a](http://example.com/y.png "t&quot; onerror=&quot;alert(1)")',
+    "# a&quot; onclick=&quot;alert(1)",
+    "# a&#39; onclick=&#39;alert(1)",
+    "# &lt;script&gt;alert(1)&lt;/script&gt;",
+    "*[HTML]: a&quot; onclick=&quot;alert(1)\n\nHTML",
+    "[[page|a&quot; onclick=&quot;alert(1)]]",
+    "[[&lt;script&gt;alert(1)&lt;/script&gt;]]",
+    # entities inside the otterwiki block plugins
+    "==&lt;script&gt;alert(1)&lt;/script&gt;==",
+    ">! &lt;script&gt;alert(1)&lt;/script&gt;",
+    ">| header a&quot; onclick=&quot;alert(1)\n>| body",
+    "> [!NOTE]\n> &lt;script&gt;alert(1)&lt;/script&gt;",
+    "::: info a&quot; onclick=&quot;x\ncontent\n:::",
+    "| a |\n|---|\n| &lt;script&gt;alert(1)&lt;/script&gt; |",
+    "- [ ] &lt;script&gt;alert(1)&lt;/script&gt;",
+    "text[^1]\n\n[^1]: &lt;script&gt;alert(1)&lt;/script&gt;",
+    "---\ntitle: a&quot; onclick=&quot;alert(1)\n---\n\ntext",
+    "```\n&lt;script&gt;alert(1)&lt;/script&gt;\n```",
+    "```html\n&lt;script&gt;alert(1)&lt;/script&gt;\n```",
+    "    &lt;script&gt;alert(1)&lt;/script&gt;",
+    "```mermaid\n&lt;script&gt;alert(1)&lt;/script&gt;\n```",
+    "`&lt;script&gt;alert(1)&lt;/script&gt;`",
+]
+
+# the event handlers otterwiki renders itself, see renderer.py and
+# renderer_plugins.py
+_OTTERWIKI_EVENT_HANDLERS = {
+    "otterwiki.copy_to_clipboard(this);",
+    "otterwiki.toggle_spoiler(this)",
+}
+
+_INJECTED_TAGS = {
+    "script",
+    "iframe",
+    "object",
+    "embed",
+    "base",
+    "form",
+    "svg",
+    "math",
+    "frame",
+    "frameset",
+    "applet",
+}
+
+_INJECTED_PROTOCOLS = ("javascript:", "vbscript:", "data:text/html")
+
+
+def _find_injections(html):
+    """Return the script injection vectors found in html, if any."""
+    problems = []
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.find_all(True):
+        name = tag.name.lower()
+        if name in _INJECTED_TAGS:
+            problems.append(f"tag <{name}>")
+        for attr, value in (tag.attrs or {}).items():
+            if isinstance(value, list):
+                value = " ".join(value)
+            if (
+                attr.lower().startswith("on")
+                and value not in _OTTERWIKI_EVENT_HANDLERS
+            ):
+                problems.append(f"event handler {attr} on <{name}>")
+            if not isinstance(value, str):
+                continue
+            # normalize like a browser does before resolving the protocol
+            normalized = re.sub(
+                r"[\x00-\x20\x7f]", "", html_module.unescape(value)
+            ).lower()
+            if normalized.startswith(_INJECTED_PROTOCOLS):
+                problems.append(f"dangerous protocol in {attr} on <{name}>")
+            if attr.lower() == "style" and is_dangerous_style(value):
+                problems.append(f"dangerous css in style on <{name}>")
+    return sorted(set(problems))
+
+
+def test_entities_no_xss():
+    for md in _ENTITY_XSS_PAYLOADS:
+        html, _, _ = render.markdown(md)
+        assert not _find_injections(html), (md, html)
+        # the same in preview mode, where the cursor span is injected
+        html, _, _ = render.markdown(md, cursor=0)
+        assert not _find_injections(html), (md, html)
+
+
+def test_entities_no_xss_with_custom_allowlist():
+    renderer = OtterwikiRenderer(
+        config={"RENDERER_HTML_ALLOWLIST": "span[data-x], div[data-y]"}
+    )
+    for md in _ENTITY_XSS_PAYLOADS:
+        html, _, _ = renderer.markdown(md)
+        assert not _find_injections(html), (md, html)
+
+
+def test_entities_are_rendered():
+    """The entities themselves must arrive in the browser (issue: &middot;)."""
+    for md, expected in [
+        ("a &middot; b", "·"),
+        ("a &#183; b", "·"),
+        ("a &#xB7; b", "·"),
+        ("&copy; 2026", "©"),
+        ("5 &lt; 6", "5 &lt; 6"),
+        ("AT&amp;T", "AT&amp;T"),
+    ]:
+        html, _, _ = render.markdown(md)
+        assert expected in html, (md, html)
+
+
+def test_entity_encoded_heading_escaped_in_page(test_client):
+    """A heading with entity encoded html ends up in the page title, the
+    og:title meta tag and the toc: all of them must escape it."""
+    payloads = [
+        "# &lt;script&gt;alert(1)&lt;/script&gt;\n\ntext\n",
+        "# &lt;img src=x onerror=alert(1)&gt;\n\ntext\n",
+        '# a&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;\n\ntext\n',
+    ]
+    for i, content in enumerate(payloads):
+        rv = test_client.post(
+            f"/EntityHeading{i}/save",
+            data={"content": content, "commit": "test"},
+            follow_redirects=True,
+        )
+        assert rv.status_code == 200
+        html = rv.data.decode()
+        # nothing is unescaped anywhere in the response
+        assert "<script>alert(1)" not in html
+        assert "<img src=x" not in html
+        # and the rendered page carries no injected tag or handler
+        article = BeautifulSoup(html, "html.parser").find("article")
+        assert article is not None
+        assert not _find_injections(str(article)), html
+
+
+def test_clean_html_style_dangerous():
+    """A style attribute must not smuggle script or a remote stylesheet."""
+    vectors = [
+        # url() with a dangerous protocol
+        '<span style="background:url(javascript:alert(1))">x</span>',
+        '<span style="background:url(\'javascript:alert(1)\')">x</span>',
+        '<span style="background:url(&quot;javascript:alert(1)&quot;)">x</span>',
+        '<span style="background: url( javascript:alert(1) )">x</span>',
+        '<span style="background:URL(JavaScript:alert(1))">x</span>',
+        '<span style="background:url(vbscript:alert(1))">x</span>',
+        '<span style="background:url(data:text/html,<script>alert(1)</script>)">x</span>',
+        # entity encoded
+        '<span style="background:url(&#106;avascript:alert(1))">x</span>',
+        '<span style="background:url(jav&#x09;ascript:alert(1))">x</span>',
+        '<span style="&#98;ackground:url(&#106;avascript:alert(1))">x</span>',
+        # css escapes
+        r'<span style="background:url(\6a avascript:alert(1))">x</span>',
+        r'<span style="background:url(\6A\61\76\61\73\63\72\69\70\74\3a alert(1))">x</span>',
+        r'<span style="background:url(j\61vascript:alert(1))">x</span>',
+        # css comments
+        '<span style="background:url(/**/javascript:alert(1))">x</span>',
+        '<span style="width:expr/**/ession(alert(1))">x</span>',
+        # script constructs
+        '<span style="width:expression(alert(1))">x</span>',
+        '<span style="behavior:url(#default#time2)">x</span>',
+        '<span style="-moz-binding:url(http://example.com/x.xml#e)">x</span>',
+        "<span style=\"@import 'http://example.com/x.css'\">x</span>",
+        r'<span style="\40 import \27 http://example.com/x.css\27 ">x</span>',
+        # on a tag whose style comes from the generic '*' attributes
+        '<td style="background:url(javascript:alert(1))">x</td>',
+    ]
+    for vector in vectors:
+        # the whole element is escaped, so it renders as inert text
+        assert clean_html(vector) == str(escape(vector)), vector
+
+
+def test_clean_html_style_harmless():
+    """Ordinary inline styles must keep working."""
+    for harmless in [
+        '<span style="color:red">x</span>',
+        '<span style="opacity:0.8;text-align:justify">x</span>',
+        '<td style="text-align:center">x</td>',
+        '<span style="background:url(/attachments/img.png)">x</span>',
+        '<span style="background:url(\'https://example.com/img.png\')">x</span>',
+        '<span style="background:url(https://example.com/a.png?a=1&amp;b=2)">x</span>',
+        '<span style="font-family:\'Java Script\'">x</span>',
+        '<span style="content:\'a/*b\'">x</span>',
+    ]:
+        assert clean_html(harmless) == harmless, harmless
+
+
+def test_markdown_style_dangerous():
+    """The same, through the renderer."""
+    for md in [
+        '<span style="background:url(javascript:alert(1))">x</span>',
+        '<span style="width:expression(alert(1))">x</span>',
+        r'<span style="background:url(\6a avascript:alert(1))">x</span>',
+    ]:
+        html, _, _ = render.markdown(md)
+        assert not _find_injections(html), (md, html)
+        # no element is left at all, the source shows up as text
+        assert BeautifulSoup(html, "html.parser").find("span") is None
+    # a harmless style survives the round trip
+    html, _, _ = render.markdown('<span style="color:red">x</span>')
+    span = BeautifulSoup(html, "html.parser").find("span")
+    assert span is not None
+    assert span.attrs.get("style") == "color:red"
+
+
+def test_pygments_render_lines():
+    code = "# Head\n\n```python\ns = \"\"\"a\nb\"\"\"\n```\n<b>\n"
+    lines = pygments_render_lines(code, "markdown")
+    # one line of html per line of code, each with balanced spans
+    assert len(lines) == len(code.splitlines())
+    for line in lines:
+        assert line.count("<span") == line.count("</span>")
+    assert lines[0] == '<span class="gh"># Head</span>'
+    assert "&lt;b&gt;" in lines[-1]
+    # unknown languages are escaped
+    assert pygments_render_lines("<i>\nx", "nonexistent") == ["&lt;i&gt;", "x"]

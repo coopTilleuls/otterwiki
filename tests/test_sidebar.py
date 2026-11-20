@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # vim: set et ts=8 sts=4 sw=4 ai:
 
+import json
 import os
 
 from bs4 import BeautifulSoup
@@ -176,6 +177,107 @@ def test_sidebar_custom_menu_with_icons(create_app, test_client, req_ctx):
     assert menu_data["items"][0]["type"] == "link"
     assert '<i class="fas fa-home"></i>' in menu_data["items"][0]["html"]
     assert "Home Page" in menu_data["items"][0]["text"]
+
+
+def _assert_no_xss(link_html):
+    """Assert that the rendered link contains no executable HTML."""
+    soup = BeautifulSoup(link_html, "html.parser")
+
+    # no dangerous elements
+    assert soup.find("script") is None
+    assert soup.find("img") is None
+    assert soup.find("svg") is None
+    assert soup.find("iframe") is None
+    assert soup.find("object") is None
+    assert soup.find("embed") is None
+
+    # no event handler attributes anywhere
+    for element in soup.find_all(True):
+        for attr in element.attrs:
+            assert not attr.lower().startswith("on"), (
+                "event handler attribute found: %s" % attr
+            )
+
+    # no dangerous URL protocols in href/src
+    for element in soup.find_all(True):
+        for attr in ("href", "src", "poster"):
+            value = element.get(attr)
+            if value:
+                assert (
+                    not value.lower()
+                    .lstrip()
+                    .startswith(("javascript:", "data:", "vbscript:", "file:"))
+                ), ("dangerous URL protocol in %s" % attr)
+
+
+def test_sidebar_custom_menu_icon_xss(create_app, test_client, req_ctx):
+    """
+    Icons in the sidebar custom menu are rendered as raw HTML; a malicious
+    payload must be neutralized so it cannot execute in a visitor's browser.
+    """
+    payloads = [
+        # event handler on a tag (the reported PoC)
+        "<img src=x onerror=alert('xss')>",
+        "<svg onload=alert('xss')></svg>",
+        # script injection
+        "<script>alert('xss')</script>",
+        # javascript: in an attribute
+        '<a href="javascript:alert(1)">x</a>',
+        # data: URL in an img src
+        '<img src="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">',
+        # attribute breakout trying to inject an event handler
+        '<i class="fas fa-home" onclick="alert(1)"></i>',
+    ]
+
+    for payload in payloads:
+        create_app.config["SIDEBAR_CUSTOM_MENU"] = (
+            '[{"link": "Home", "title": "Home Page", "icon": %s}]'
+            % json.dumps(payload)
+        )
+        menu_data = get_sidebar_menu(test_client)
+        assert menu_data is not None
+        _assert_no_xss(menu_data["items"][0]["html"])
+
+    # the dangerous payload must not appear verbatim anywhere in the page
+    create_app.config["SIDEBAR_CUSTOM_MENU"] = (
+        """[{"link": "Home", "title": "Home Page", "icon": "<img src=x onerror=alert('xss')>"}]"""
+    )
+    rv = test_client.get("/")
+    assert rv.status_code == 200
+    assert "<img src=x onerror=" not in rv.data.decode().lower()
+
+    # legitimate font-awesome icons must still render as HTML
+    create_app.config["SIDEBAR_CUSTOM_MENU"] = (
+        '[{"link": "Home", "title": "Home Page", "icon": %s}]'
+        % json.dumps('<i class="fas fa-home"></i>')
+    )
+    menu_data = get_sidebar_menu(test_client)
+    assert menu_data is not None
+    assert '<i class="fas fa-home"></i>' in menu_data["items"][0]["html"]
+
+
+def test_sidebar_custom_menu_icon_allowlist(create_app, test_client, req_ctx):
+    """
+    Icons are sanitized with the allowlist configured for the markdown
+    renderer, so tags allowed there must not be stripped from the sidebar.
+    """
+    icon = '<svg class="icon"><path d="M0 0"></path></svg>'
+    create_app.config["SIDEBAR_CUSTOM_MENU"] = (
+        '[{"link": "Home", "title": "Home Page", "icon": %s}]'
+        % json.dumps(icon)
+    )
+
+    # without the allowlist the icon is escaped
+    create_app.config["RENDERER_HTML_ALLOWLIST"] = ""
+    menu_data = get_sidebar_menu(test_client)
+    assert menu_data is not None
+    assert "<svg" not in menu_data["items"][0]["html"]
+
+    # with svg allowlisted the icon is rendered as html
+    create_app.config["RENDERER_HTML_ALLOWLIST"] = "svg,path[d]"
+    menu_data = get_sidebar_menu(test_client)
+    assert menu_data is not None
+    assert icon in menu_data["items"][0]["html"]
 
 
 def test_sidebar_custom_menu_with_separator(create_app, test_client, req_ctx):
@@ -379,3 +481,58 @@ def test_sidebar_menutree_focus_off_unfolds_everything(
         assert d.has_attr(
             "open"
         ), f"folder {d.find('summary').get_text(strip=True)!r} should be open"
+
+
+def test_sidebar_menutree_lists_internal_directory_symlink_as_leaf(
+    create_app, req_ctx
+):
+    from otterwiki.sidebar import SidebarPageIndex
+
+    storage = create_app.storage
+    create_app.config["SIDEBAR_MENUTREE_FOCUS"] = "OFF"
+
+    storage.store(
+        "target/folder/page.md",
+        "# Target Page",
+        author=("Test", "test@example.org"),
+    )
+    os.makedirs(os.path.join(storage.path, "shortcuts"), exist_ok=True)
+    os.makedirs(os.path.join(storage.path, "empty"), exist_ok=True)
+    os.symlink(
+        "../target/folder",
+        os.path.join(storage.path, "shortcuts/folder"),
+    )
+
+    tree = SidebarPageIndex(path="/").query()
+
+    assert "shortcuts" in tree
+    assert "folder" in tree["shortcuts"].children
+
+    alias = tree["shortcuts"].children["folder"]
+    assert alias.path == "Shortcuts/Folder"
+    assert not alias.children
+
+    # Ordinary empty directories keep their existing behaviour: they are
+    # not added to the sidebar tree merely because storage.list() sees them.
+    assert "empty" not in tree
+
+    directories_only = SidebarPageIndex(
+        path="/", mode="DIRECTORIES_ONLY"
+    ).query()
+    assert "shortcuts" in directories_only
+    assert "folder" in directories_only["shortcuts"].children
+    directory_alias = directories_only["shortcuts"].children["folder"]
+    assert directory_alias.is_directory_symlink
+    assert not directory_alias.children
+    assert "page" not in directories_only["target"].children["folder"].children
+
+    # When a page shadows the alias, it remains a page (not a directory).
+    storage.store(
+        "shortcuts/folder.md",
+        "# Shadowing Page",
+        author=("Test", "test@example.org"),
+    )
+    directories_only = SidebarPageIndex(
+        path="/", mode="DIRECTORIES_ONLY"
+    ).query()
+    assert "folder" not in directories_only["shortcuts"].children

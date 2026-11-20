@@ -6,7 +6,6 @@ import os.path
 
 from flask import (
     redirect,
-    url_for,
     render_template,
     abort,
 )
@@ -19,6 +18,7 @@ from otterwiki.models import Drafts
 from otterwiki.auth import has_permission, get_author
 
 from otterwiki.helper import (
+    url_for,
     toast,
     get_filename,
     get_pagename,
@@ -26,6 +26,7 @@ from otterwiki.helper import (
 
 from otterwiki.util import (
     empty,
+    plural,
 )
 
 
@@ -159,6 +160,50 @@ def handle_housekeeping_emptypages(form):
     )
 
 
+# Fenced code blocks (```...``` or ~~~...~~~), e.g. mermaid diagrams.
+# Mermaid's double-bracket "subroutine" node shape (e.g. `x[["Switch"]]`)
+# looks exactly like a WikiLink to WIKI_LINK_PATTERN below, so fenced
+# code has to be stripped from the page content before scanning for
+# WikiLinks, or every such node gets misreported as a broken link.
+#
+# This has to match mistune's own fence-closing rule, or stripping goes
+# wrong in both directions:
+#   - mistune closes a fence on a closing line of the *same or greater*
+#     length (`(?P=fence)(?P=c)*`), not only an exact-length match. A
+#     shorter regex that requires an exact match misses a longer closing
+#     fence, runs on into the next fenced block, and swallows content
+#     (and any real broken links) that sits between them.
+#   - mistune lets an unclosed fence run to EOF (`|\Z` below), rather
+#     than leaving it unmatched, so a page ending mid-fence still has
+#     its contents stripped instead of being scanned as if it were
+#     regular text.
+# mistune only allows spaces (not tabs) in the fence's leading indent.
+FENCED_CODE_BLOCK_PATTERN = re.compile(
+    r"^ {0,3}(?P<fence>(?P<c>[`~])(?P=c){2,})[^\n]*\n"
+    r".*?(?:^ {0,3}(?P=fence)(?P=c)*[ \t]*$|\Z)",
+    re.DOTALL | re.MULTILINE,
+)
+
+# Inline code spans (`...`), which fenced-block stripping above does not
+# cover. Just like a mermaid node inside a fence, a `[[...]]` inside an
+# inline code span (e.g. `` `df[['a', "b"]]` `` or `` `[[Page]]` ``)
+# looks exactly like a WikiLink, so inline code has to be stripped too.
+#
+# This mirrors mistune's own codespan rule (see mistune's
+# InlineParser.parse_codespan): an opening run of N backticks, then a
+# closing run of the *same* length not followed by another backtick,
+# with at least one non-backtick before the close. Newlines act like
+# spaces within a span, but a code span cannot cross a blank line (it
+# lives inside a single block), which the blank-line guard enforces so a
+# stray unmatched backtick can't swallow a real WikiLink further down.
+INLINE_CODE_SPAN_PATTERN = re.compile(
+    r"(?<!`)(?P<ticks>`+)(?!`)"
+    r"(?:(?!\n[ \t]*\n).)*?[^`]"
+    r"(?P=ticks)(?!`)",
+    re.DOTALL,
+)
+
+
 def handle_housekeeping_brokenwikilinks(form):
     """Analyze pages for broken WikiLinks."""
     if not has_permission("WRITE"):
@@ -184,7 +229,16 @@ def handle_housekeeping_brokenwikilinks(form):
             continue
         current_pagename = get_pagename(filename, full=True)
 
-        wikilinks = WIKI_LINK_PATTERN.findall(content)
+        # Strip fenced code blocks (e.g. mermaid diagrams) and then
+        # inline code spans so their contents are never mistaken for
+        # WikiLinks. Fenced blocks are removed first so their backticks
+        # can't be mistaken for inline-span delimiters.
+        content_without_code = FENCED_CODE_BLOCK_PATTERN.sub("", content)
+        content_without_code = INLINE_CODE_SPAN_PATTERN.sub(
+            "", content_without_code
+        )
+
+        wikilinks = WIKI_LINK_PATTERN.findall(content_without_code)
 
         if not wikilinks:
             continue
@@ -291,6 +345,51 @@ def handle_housekeeping_brokenwikilinks(form):
     )
 
 
+def handle_housekeeping_gitgc(form):
+    """Run git gc to pack the loose objects of the repository."""
+    if not has_permission("ADMIN"):
+        abort(403)
+
+    t_start = timer()
+    try:
+        before = storage.count_objects()
+        storage.gc()
+        after = storage.count_objects()
+    except StorageError as e:
+        app.logger.error(f"housekeeping_gitgc failed: {e}")
+        return render_template("tools/housekeeping_gitgc.html", error=str(e))
+    duration = timer() - t_start
+    app.logger.info(f"housekeeping_gitgc took {duration:.3f} seconds.")
+
+    # 'git count-objects -v' reports one "key: value" per line
+    def parse(output):
+        return dict(
+            line.split(": ", 1) for line in output.splitlines() if ": " in line
+        )
+
+    before, after = parse(before), parse(after)
+    packed = max(0, int(after["in-pack"]) - int(before["in-pack"]))
+    duplicates = int(before["prune-packable"])
+    remaining = int(after["count"])
+
+    summary = (
+        f"Packed {plural(packed, 'loose object')} ({before['size']})"
+        if packed
+        else "No loose objects to pack"
+    )
+    if duplicates:
+        summary += f", removed {plural(duplicates, 'duplicate')}"
+    summary += f". Pack size {before['size-pack']} → {after['size-pack']}."
+    if remaining:
+        summary += f" {plural(remaining, 'loose object')} kept."
+
+    return render_template(
+        "tools/housekeeping_gitgc.html",
+        summary=summary,
+        duration=f"{duration:.3f}s",
+    )
+
+
 def handle_housekeeping(form):
     if form.get("task", None) == "drafts":
         return handle_housekeeping_drafts(form)
@@ -298,6 +397,8 @@ def handle_housekeeping(form):
         return handle_housekeeping_emptypages(form)
     if form.get("task", None) == "brokenwikilinks":
         return handle_housekeeping_brokenwikilinks(form)
+    if form.get("task", None) == "gitgc":
+        return handle_housekeeping_gitgc(form)
     # unkown task: display the form
     toast("Unkown task", "error")
     return redirect(url_for("housekeeping"))

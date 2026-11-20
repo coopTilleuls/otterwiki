@@ -3,6 +3,7 @@
 
 import json
 import pytest
+from unittest.mock import patch
 
 
 class TestHousekeepingEmptyPages:
@@ -588,6 +589,215 @@ Link to [[Parent Sub/Child Sub]] and [[Parent Sub/Missing Sub]].
 
         assert "Missing" in html or "../Missing" in html
 
+    def test_housekeeping_broken_wikilinks_ignores_mermaid_nodes(
+        self, app_with_user, admin_client
+    ):
+        """Mermaid's [["Node Label"]] double-bracket node syntax inside a
+        fenced code block must not be mistaken for a WikiLink."""
+        from otterwiki.server import storage
+        from otterwiki.helper import get_filename
+
+        app_with_user.config["WIKILINK_STYLE"] = ""
+
+        storage.store(
+            get_filename("Page With Mermaid"),
+            (
+                "# Page With Mermaid\n\n"
+                "```mermaid\n"
+                "graph TD\n"
+                '    attic_switch[["Switch"]]:::switch\n'
+                '    attic_switch --> attic_lightbulb[["Lightbulb"]]\n'
+                "```\n"
+            ),
+            message="Create page with mermaid diagram",
+            author=("Test User", "mail@example.org"),
+        )
+
+        rv = admin_client.post(
+            "/-/housekeeping",
+            data={"task": "brokenwikilinks"},
+            follow_redirects=True,
+        )
+        assert rv.status_code == 200
+        html = rv.data.decode()
+
+        assert "no broken" in html.lower()
+        assert "Switch" not in html
+        assert "Lightbulb" not in html
+
+    def test_housekeeping_broken_wikilinks_mermaid_does_not_mask_real_links(
+        self, app_with_user, admin_client
+    ):
+        """A genuinely broken WikiLink outside a mermaid fence must still
+        be reported, proving the fence-stripping fix doesn't mask real
+        broken links."""
+        from otterwiki.server import storage
+        from otterwiki.helper import get_filename
+
+        app_with_user.config["WIKILINK_STYLE"] = ""
+
+        storage.store(
+            get_filename("Page With Mermaid And Broken Link"),
+            (
+                "# Page With Mermaid And Broken Link\n\n"
+                "```mermaid\n"
+                "graph TD\n"
+                '    attic_switch[["Switch"]]:::switch\n'
+                "```\n\n"
+                "See also [[Missing Page]].\n"
+            ),
+            message="Create page",
+            author=("Test User", "mail@example.org"),
+        )
+
+        rv = admin_client.post(
+            "/-/housekeeping",
+            data={"task": "brokenwikilinks"},
+            follow_redirects=True,
+        )
+        assert rv.status_code == 200
+        html = rv.data.decode()
+
+        assert "Missing Page" in html
+        assert "Switch" not in html
+
+    def test_housekeeping_broken_wikilinks_mermaid_longer_closing_fence(
+        self, app_with_user, admin_client
+    ):
+        """A closing fence longer than the opener (mistune allows this,
+        e.g. opened with ``` and closed with ````) must still be
+        recognized as the end of the block, and content in a second
+        fenced block right after it must not be swallowed along with
+        it."""
+        from otterwiki.server import storage
+        from otterwiki.helper import get_filename
+
+        app_with_user.config["WIKILINK_STYLE"] = ""
+
+        storage.store(
+            get_filename("Page With Longer Closing Fence"),
+            (
+                "# Page With Longer Closing Fence\n\n"
+                "```mermaid\n"
+                'attic_switch[["Switch"]]\n'
+                "````\n"
+                "See also [[Missing Page Longer Fence]].\n"
+            ),
+            message="Create page",
+            author=("Test User", "mail@example.org"),
+        )
+
+        rv = admin_client.post(
+            "/-/housekeeping",
+            data={"task": "brokenwikilinks"},
+            follow_redirects=True,
+        )
+        assert rv.status_code == 200
+        html = rv.data.decode()
+
+        assert "Switch" not in html
+        assert "Missing Page Longer Fence" in html
+
+    def test_housekeeping_broken_wikilinks_mermaid_unclosed_fence(
+        self, app_with_user, admin_client
+    ):
+        """An unclosed fence (mistune treats the rest of the page as
+        code, running to EOF) must still have its mermaid node syntax
+        stripped, not just a fence with a matching close."""
+        from otterwiki.server import storage
+        from otterwiki.helper import get_filename
+
+        app_with_user.config["WIKILINK_STYLE"] = ""
+
+        storage.store(
+            get_filename("Page With Unclosed Fence"),
+            (
+                "# Page With Unclosed Fence\n\n"
+                "```mermaid\n"
+                'attic_switch[["Switch"]]\n'
+            ),
+            message="Create page",
+            author=("Test User", "mail@example.org"),
+        )
+
+        rv = admin_client.post(
+            "/-/housekeeping",
+            data={"task": "brokenwikilinks"},
+            follow_redirects=True,
+        )
+        assert rv.status_code == 200
+        html = rv.data.decode()
+
+        assert "Switch" not in html
+
+    def test_housekeeping_broken_wikilinks_inline_code_span(
+        self, app_with_user, admin_client
+    ):
+        """A [[...]] inside an inline code span (single backticks) is not
+        a WikiLink and must not be reported as broken, e.g. a `[[Page]]`
+        reference or python subscripts like `df[['a', "b"]]`."""
+        from otterwiki.server import storage
+        from otterwiki.helper import get_filename
+
+        app_with_user.config["WIKILINK_STYLE"] = ""
+
+        storage.store(
+            get_filename("Page With Inline Code"),
+            (
+                "# Page With Inline Code\n\n"
+                "A reference `[[Inline Code Page]]` in text.\n\n"
+                'And a subscript `df[[\'a\', "b"]]` too.\n\n'
+                "Double ticks ``[[Double Tick Page]]`` as well.\n"
+            ),
+            message="Create page",
+            author=("Test User", "mail@example.org"),
+        )
+
+        rv = admin_client.post(
+            "/-/housekeeping",
+            data={"task": "brokenwikilinks"},
+            follow_redirects=True,
+        )
+        assert rv.status_code == 200
+        html = rv.data.decode()
+
+        assert "Inline Code Page" not in html
+        assert "Double Tick Page" not in html
+
+    def test_housekeeping_broken_wikilinks_inline_code_does_not_mask_real(
+        self, app_with_user, admin_client
+    ):
+        """A genuinely broken WikiLink next to an inline code span must
+        still be reported, and a stray unmatched backtick must not
+        swallow it."""
+        from otterwiki.server import storage
+        from otterwiki.helper import get_filename
+
+        app_with_user.config["WIKILINK_STYLE"] = ""
+
+        storage.store(
+            get_filename("Page With Inline Code And Broken Link"),
+            (
+                "# Page With Inline Code And Broken Link\n\n"
+                "See `[[In Code]]` and also [[Missing Inline Page]].\n\n"
+                "A ` stray backtick then [[Second Missing Page]].\n"
+            ),
+            message="Create page",
+            author=("Test User", "mail@example.org"),
+        )
+
+        rv = admin_client.post(
+            "/-/housekeeping",
+            data={"task": "brokenwikilinks"},
+            follow_redirects=True,
+        )
+        assert rv.status_code == 200
+        html = rv.data.decode()
+
+        assert "In Code" not in html
+        assert "Missing Inline Page" in html
+        assert "Second Missing Page" in html
+
 
 class TestHousekeepingSecurityCheck:
     """Tests for the security check functionality."""
@@ -671,6 +881,121 @@ class TestHousekeepingSecurityCheck:
         # In test config, we expect at least some findings
         # (e.g., SERVER_NAME not set, anonymous write access)
         assert len(results["issues"]) > 0
+
+
+class TestHousekeepingGitGc:
+    """Tests for the git garbage collection functionality."""
+
+    def test_housekeeping_page_contains_gitgc_section(
+        self, app_with_user, admin_client
+    ):
+        rv = admin_client.get("/-/housekeeping")
+        assert rv.status_code == 200
+        html = rv.data.decode()
+        assert "Git Garbage Collection" in html
+        assert 'value="gitgc"' in html
+
+    def test_housekeeping_page_hides_gitgc_for_non_admin(
+        self, app_with_user, other_client
+    ):
+        rv = other_client.get("/-/housekeeping")
+        assert rv.status_code == 200
+        html = rv.data.decode()
+        assert "Git Garbage Collection" not in html
+        assert 'value="gitgc"' not in html
+
+    def test_gitgc_packs_loose_objects(self, app_with_user, admin_client):
+        from otterwiki.server import storage
+
+        storage.store(
+            "gitgc.md",
+            content="gitgc\n",
+            author=("Test User", "mail@example.org"),
+        )
+        assert "packs: 0" in storage.count_objects()
+
+        rv = admin_client.post("/-/housekeeping", data={"task": "gitgc"})
+        assert rv.status_code == 200
+        html = rv.data.decode()
+        assert "Packed " in html
+        assert "Pack size 0 bytes → " in html
+        assert "Finished in" in html
+
+        stats = storage.count_objects()
+        assert "count: 0" in stats
+        assert "packs: 1" in stats
+
+    @pytest.mark.parametrize(
+        "before,after,summary",
+        [
+            (
+                (175, "852.00 KiB", 1383, "20.61 MiB", 28),
+                (0, "0 bytes", 1530, "20.80 MiB", 0),
+                "Packed 147 loose objects (852.00 KiB), removed 28"
+                " duplicates. Pack size 20.61 MiB → 20.80 MiB.",
+            ),
+            (
+                (1, "4.00 KiB", 10, "1.00 MiB", 0),
+                (0, "0 bytes", 11, "1.01 MiB", 0),
+                "Packed 1 loose object (4.00 KiB). Pack size 1.00 MiB"
+                " → 1.01 MiB.",
+            ),
+            (
+                (0, "0 bytes", 10, "1.00 MiB", 0),
+                (0, "0 bytes", 10, "1.00 MiB", 0),
+                "No loose objects to pack. Pack size 1.00 MiB → 1.00 MiB.",
+            ),
+            (
+                (5, "20.00 KiB", 10, "1.00 MiB", 1),
+                (2, "8.00 KiB", 12, "1.01 MiB", 0),
+                "Packed 2 loose objects (20.00 KiB), removed 1 duplicate."
+                " Pack size 1.00 MiB → 1.01 MiB. 2 loose objects kept.",
+            ),
+        ],
+    )
+    def test_gitgc_summary(
+        self, app_with_user, admin_client, before, after, summary
+    ):
+        def count_objects(stats):
+            count, size, in_pack, size_pack, prune_packable = stats
+            return (
+                f"count: {count}\nsize: {size}\nin-pack: {in_pack}\n"
+                f"packs: 1\nsize-pack: {size_pack}\n"
+                f"prune-packable: {prune_packable}\ngarbage: 0\n"
+                f"size-garbage: 0 bytes"
+            )
+
+        with (
+            patch(
+                "otterwiki.gitstorage.GitStorage.count_objects",
+                side_effect=[count_objects(before), count_objects(after)],
+            ),
+            patch("otterwiki.gitstorage.GitStorage.gc"),
+        ):
+            rv = admin_client.post("/-/housekeeping", data={"task": "gitgc"})
+        assert rv.status_code == 200
+        assert summary in rv.data.decode()
+
+    def test_gitgc_error(self, app_with_user, admin_client):
+        from otterwiki.gitstorage import StorageError
+
+        with patch(
+            "otterwiki.gitstorage.GitStorage.gc",
+            side_effect=StorageError("gc exploded"),
+        ):
+            rv = admin_client.post("/-/housekeeping", data={"task": "gitgc"})
+        assert rv.status_code == 200
+        html = rv.data.decode()
+        assert "Git Garbage Collection failed" in html
+        assert "gc exploded" in html
+
+    def test_gitgc_requires_admin(self, app_with_user, other_client):
+        rv = other_client.post(
+            "/-/housekeeping",
+            data={"task": "gitgc"},
+            follow_redirects=False,
+        )
+        assert rv.status_code == 403
 
 
 class TestHousekeepingGeneral:

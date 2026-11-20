@@ -26,6 +26,587 @@ def test_healthz(test_client):
     assert "ok" in result.data.decode()
 
 
+@pytest.fixture
+def internal_page_symlink(create_app):
+    storage = create_app.storage
+
+    storage.store(
+        "target/page.md",
+        content="# Target\n",
+        author=("Test", "test@example.org"),
+    )
+    os.makedirs(os.path.join(storage.path, "shortcuts"), exist_ok=True)
+    os.symlink(
+        "../target/page.md",
+        os.path.join(storage.path, "shortcuts/link.md"),
+    )
+
+    storage.commit(
+        ["shortcuts/link.md"],
+        message="Add shortcut",
+        author=("Test", "test@example.org"),
+    )
+
+    return storage
+
+
+@pytest.fixture
+def internal_directory_symlink(create_app):
+    storage = create_app.storage
+
+    storage.store(
+        "target/folder/page.md",
+        content="# Directory Target\n",
+        author=("Test", "test@example.org"),
+    )
+    os.makedirs(os.path.join(storage.path, "shortcuts"), exist_ok=True)
+    os.symlink(
+        "../target/folder",
+        os.path.join(storage.path, "shortcuts/folder"),
+    )
+
+    return storage
+
+
+def test_internal_symlinks_empty_revision_do_not_redirect(
+    test_client, internal_page_symlink, internal_directory_symlink
+):
+    for path in ("/Shortcuts/Link", "/Shortcuts/Folder"):
+        rv = test_client.get(f"{path}?revision=")
+
+        assert rv.status_code in (200, 404)
+        assert rv.headers.get("Location") is None
+
+
+def test_internal_page_symlink_redirects_to_target(
+    test_client, internal_page_symlink
+):
+    rv = test_client.get("/Shortcuts/Link")
+
+    assert rv.status_code == 302
+    assert rv.headers["Location"] == "/Target/Page"
+
+
+def test_internal_page_symlink_edit_redirects_to_target(
+    test_client, internal_page_symlink
+):
+    rv = test_client.get("/Shortcuts/Link?edit")
+
+    assert rv.status_code == 302
+    assert rv.headers["Location"] == "/Target/Page?edit"
+
+
+def test_internal_page_symlink_post_does_not_redirect(
+    test_client, internal_page_symlink
+):
+    rv = test_client.post("/Shortcuts/Link")
+
+    assert rv.status_code == 200
+    assert rv.headers.get("Location") is None
+
+
+def test_internal_page_symlink_preserves_percent_encoded_query(
+    test_client, internal_page_symlink
+):
+    rv = test_client.get("/Shortcuts/Link?raw=%FF&encoded=%FF+%20&a=1&a=2")
+
+    assert rv.status_code == 302
+    assert rv.headers["Location"] == (
+        "/Target/Page?raw=%FF&encoded=%FF+%20&a=1&a=2"
+    )
+
+
+def test_internal_page_symlink_encodes_raw_invalid_query_bytes(test_client):
+    from otterwiki.wiki import _redirect_internal_symlink_target
+
+    # Werkzeug parses request.values before routing. The raw-byte case
+    # therefore exercises only the redirect helper.
+    with test_client.application.test_request_context(
+        "/Shortcuts/Link",
+        environ_overrides={"QUERY_STRING": "raw=\xff&encoded=%FF+%20&a=1&a=2"},
+    ):
+        rv = _redirect_internal_symlink_target("Target/Page")
+
+    assert rv.status_code == 302
+    assert rv.headers["Location"] == (
+        "/Target/Page?raw=%FF&encoded=%FF+%20&a=1&a=2"
+    )
+
+
+def test_internal_page_symlink_revision_is_not_redirected(
+    test_client, internal_page_symlink
+):
+    revision = internal_page_symlink.log("shortcuts/link.md")[0]["revision"]
+
+    rv = test_client.get(f"/Shortcuts/Link?revision={revision}")
+
+    assert rv.status_code == 200
+    assert rv.headers.get("Location") is None
+
+
+def test_internal_page_symlink_empty_revision_is_not_redirected(
+    test_client, internal_page_symlink
+):
+    rv = test_client.get("/Shortcuts/Link?revision=")
+
+    assert rv.status_code == 404
+    assert rv.headers.get("Location") is None
+
+
+def test_internal_page_symlink_does_not_leak_target_without_read_permission(
+    test_client, create_app, internal_page_symlink, monkeypatch
+):
+    monkeypatch.setitem(create_app.config, "READ_ACCESS", "REGISTERED")
+
+    rv = test_client.get("/Shortcuts/Link")
+
+    assert rv.status_code == 302
+    assert "/-/login" in rv.headers["Location"]
+    assert "/Target/Page" not in rv.headers["Location"]
+
+
+def test_internal_page_symlink_sanitizes_before_redirect(
+    test_client, create_app, monkeypatch
+):
+    monkeypatch.setitem(create_app.config, "RETAIN_PAGE_NAME_CASE", False)
+    storage = create_app.storage
+    storage.store(
+        "foobar.md",
+        content="# Ordinary page\n",
+        author=("Test", "test@example.org"),
+    )
+    storage.store(
+        "target/page.md",
+        content="# Target page\n",
+        author=("Test", "test@example.org"),
+    )
+    os.symlink("target/page.md", os.path.join(storage.path, "foo.bar.md"))
+
+    rv = test_client.get("/Foo.Bar")
+
+    assert rv.status_code == 200
+    assert rv.headers.get("Location") is None
+    assert "Ordinary page" in rv.data.decode()
+
+
+def test_internal_page_symlink_with_noncanonical_case_is_not_redirected(
+    test_client, create_app, monkeypatch
+):
+    storage = create_app.storage
+    monkeypatch.setitem(create_app.config, "RETAIN_PAGE_NAME_CASE", False)
+
+    storage.store(
+        "Upper/Page.md",
+        content="# Upper Target\n",
+        author=("Test", "test@example.org"),
+    )
+    os.makedirs(os.path.join(storage.path, "shortcuts"), exist_ok=True)
+    os.symlink(
+        "../Upper/Page.md",
+        os.path.join(storage.path, "shortcuts/case.md"),
+    )
+
+    rv = test_client.get("/Shortcuts/Case")
+
+    assert rv.status_code == 200
+    assert "Upper Target" in rv.data.decode()
+
+
+def test_internal_nonpage_symlink_is_not_redirected(test_client, create_app):
+    storage = create_app.storage
+
+    storage.store(
+        "target/data.txt",
+        content="plain target\n",
+        author=("Test", "test@example.org"),
+    )
+    os.makedirs(os.path.join(storage.path, "shortcuts"), exist_ok=True)
+    os.symlink(
+        "../target/data.txt",
+        os.path.join(storage.path, "shortcuts/file.md"),
+    )
+
+    rv = test_client.get("/Shortcuts/File")
+
+    assert rv.status_code == 200
+    assert "plain target" in rv.data.decode()
+
+
+def test_internal_page_symlink_to_directory_is_not_redirected(
+    test_client, create_app
+):
+    storage = create_app.storage
+
+    os.makedirs(os.path.join(storage.path, "target/folder.md"), exist_ok=True)
+    os.makedirs(os.path.join(storage.path, "shortcuts"), exist_ok=True)
+    os.symlink(
+        "../target/folder.md",
+        os.path.join(storage.path, "shortcuts/directory.md"),
+    )
+
+    rv = test_client.get("/Shortcuts/Directory")
+
+    assert rv.status_code == 404
+    assert rv.headers.get("Location") is None
+
+
+def test_internal_page_in_symlinked_directory_redirects(
+    test_client, create_app, monkeypatch
+):
+    monkeypatch.setitem(create_app.config, "RETAIN_PAGE_NAME_CASE", False)
+    storage = create_app.storage
+    storage.store(
+        "target/page.md",
+        content="# Target\n",
+        author=("Test", "test@example.org"),
+    )
+    os.symlink("target", os.path.join(storage.path, "alias"))
+
+    rv = test_client.get("/Alias/Page")
+
+    assert rv.status_code == 302
+    assert rv.headers["Location"] == "/Target/Page"
+
+
+def test_internal_directory_symlink_redirects_to_target(
+    test_client, internal_directory_symlink
+):
+    rv = test_client.get("/Shortcuts/Folder")
+
+    assert rv.status_code == 302
+    assert rv.headers["Location"] == "/Target/Folder"
+
+    rv = test_client.get("/Shortcuts/Folder", follow_redirects=True)
+
+    assert rv.status_code == 200
+    assert "/Target/Folder/Page" in rv.data.decode()
+
+
+def test_internal_directory_symlink_post_does_not_redirect(
+    test_client, internal_directory_symlink
+):
+    rv = test_client.post("/Shortcuts/Folder")
+
+    assert rv.status_code == 200
+    assert rv.headers.get("Location") is None
+
+
+def test_internal_page_symlink_explicit_view_redirects_to_target(
+    test_client, internal_page_symlink
+):
+    rv = test_client.get("/Shortcuts/Link/view")
+
+    assert rv.status_code == 302
+    assert rv.headers["Location"] == "/Target/Page"
+
+
+def test_internal_page_symlink_explicit_edit_redirects_to_target(
+    test_client, internal_page_symlink
+):
+    rv = test_client.get("/Shortcuts/Link/edit")
+
+    assert rv.status_code == 302
+    assert rv.headers["Location"] == "/Target/Page?edit"
+
+
+def test_internal_page_symlink_blame_redirects_to_target(
+    test_client, internal_page_symlink
+):
+    rv = test_client.get("/Shortcuts/Link/blame")
+
+    assert rv.status_code == 302
+    assert rv.headers["Location"] == "/Target/Page/blame"
+
+
+def test_internal_page_symlink_explicit_view_query_revision_stays_on_alias(
+    test_client, internal_page_symlink
+):
+    revision = internal_page_symlink.log("shortcuts/link.md")[0]["revision"]
+
+    rv = test_client.get(f"/Shortcuts/Link/view?revision={revision}")
+
+    assert rv.status_code == 200
+    assert rv.headers.get("Location") is None
+
+
+def test_internal_directory_symlink_preserves_query_string(
+    test_client, internal_directory_symlink
+):
+    rv = test_client.get("/Shortcuts/Folder?x=1&x=2")
+
+    assert rv.status_code == 302
+    assert rv.headers["Location"] == "/Target/Folder?x=1&x=2"
+
+
+def test_internal_directory_symlink_revision_is_not_redirected(
+    test_client, internal_directory_symlink
+):
+    rv = test_client.get("/Shortcuts/Folder?revision=HEAD")
+
+    assert rv.headers.get("Location") is None
+
+
+def test_internal_directory_symlink_edit_redirects_to_target(
+    test_client, internal_directory_symlink
+):
+    rv = test_client.get("/Shortcuts/Folder?edit")
+
+    assert rv.status_code == 302
+    assert rv.headers["Location"] == "/Target/Folder?edit"
+
+
+def test_internal_directory_symlink_does_not_leak_target_without_read_permission(
+    test_client, create_app, internal_directory_symlink, monkeypatch
+):
+    monkeypatch.setitem(create_app.config, "READ_ACCESS", "REGISTERED")
+
+    rv = test_client.get("/Shortcuts/Folder")
+
+    assert rv.status_code == 302
+    assert "/-/login" in rv.headers["Location"]
+    assert "/Target/Folder" not in rv.headers["Location"]
+
+
+def test_internal_directory_symlink_with_noncanonical_case_is_not_redirected(
+    test_client, create_app, monkeypatch
+):
+    storage = create_app.storage
+    monkeypatch.setitem(create_app.config, "RETAIN_PAGE_NAME_CASE", False)
+
+    storage.store(
+        "Upper/Folder/page.md",
+        content="# Upper Directory Target\n",
+        author=("Test", "test@example.org"),
+    )
+    os.makedirs(os.path.join(storage.path, "shortcuts"), exist_ok=True)
+    os.symlink(
+        "../Upper/Folder",
+        os.path.join(storage.path, "shortcuts/case"),
+    )
+
+    rv = test_client.get("/Shortcuts/Case")
+
+    assert rv.status_code == 200
+    assert "Page Index" in rv.data.decode()
+
+
+def test_internal_directory_symlink_sanitizes_before_redirect(
+    test_client, create_app, monkeypatch
+):
+    monkeypatch.setitem(create_app.config, "RETAIN_PAGE_NAME_CASE", False)
+    storage = create_app.storage
+    storage.store(
+        "foobar.md",
+        content="# Ordinary page\n",
+        author=("Test", "test@example.org"),
+    )
+    storage.store(
+        "target/folder/page.md",
+        content="# Directory target\n",
+        author=("Test", "test@example.org"),
+    )
+    os.symlink("target/folder", os.path.join(storage.path, "foo.bar"))
+
+    rv = test_client.get("/Foo.Bar")
+
+    assert rv.status_code == 200
+    assert rv.headers.get("Location") is None
+    assert "Ordinary page" in rv.data.decode()
+
+
+def test_internal_directory_symlink_trailing_slash_redirects(
+    test_client, internal_directory_symlink
+):
+    rv = test_client.get("/Shortcuts/Folder/")
+
+    assert rv.status_code == 302
+    assert rv.headers["Location"] == "/Target/Folder"
+
+
+def test_internal_directory_symlink_page_takes_precedence(
+    test_client, internal_directory_symlink
+):
+    internal_directory_symlink.store(
+        "shortcuts/folder.md",
+        content="# Shadowing Page\n",
+        author=("Test", "test@example.org"),
+    )
+
+    rv = test_client.get("/Shortcuts/Folder")
+
+    assert rv.status_code == 200
+    assert rv.headers.get("Location") is None
+    assert "Shadowing Page" in rv.data.decode()
+
+
+@pytest.mark.parametrize("path", ["!", ".", ".md", "///"])
+def test_internal_directory_symlink_ignores_empty_sanitized_paths(
+    create_app, path
+):
+    from otterwiki.auth import has_permission
+    from otterwiki.wiki import get_internal_directory_symlink_target
+
+    with create_app.test_request_context("/"):
+        assert has_permission("READ")
+        assert get_internal_directory_symlink_target(path) is None
+
+
+def test_internal_directory_symlink_external_target_does_not_redirect(
+    test_client, create_app, tmp_path
+):
+    outside_directory = tmp_path / "external"
+    outside_directory.mkdir()
+    storage = create_app.storage
+    os.makedirs(os.path.join(storage.path, "shortcuts"), exist_ok=True)
+    os.symlink(
+        str(outside_directory),
+        os.path.join(storage.path, "shortcuts", "external"),
+    )
+
+    rv = test_client.get("/Shortcuts/External")
+
+    assert rv.status_code == 404
+    assert rv.headers.get("Location") is None
+
+
+def test_internal_page_symlink_explicit_revision_stays_on_alias(
+    test_client, internal_page_symlink
+):
+    revision = internal_page_symlink.log("shortcuts/link.md")[0]["revision"]
+
+    rv = test_client.get(f"/Shortcuts/Link/view/{revision}")
+
+    assert rv.status_code == 200
+    assert rv.headers.get("Location") is None
+
+
+def test_internal_page_symlink_history_stays_on_alias(
+    test_client, internal_page_symlink
+):
+    rv = test_client.get("/Shortcuts/Link/history")
+
+    assert rv.status_code == 200
+    assert rv.headers.get("Location") is None
+
+
+def test_internal_page_symlink_rename_renames_alias_only(
+    test_client, internal_page_symlink
+):
+    storage = internal_page_symlink
+    old_alias = os.path.join(storage.path, "shortcuts/link.md")
+    new_alias = os.path.join(storage.path, "shortcuts/renamed.md")
+
+    rv = test_client.post(
+        "/Shortcuts/Link/rename",
+        data={
+            "new_pagename": "Shortcuts/Renamed",
+            "message": "Rename shortcut",
+        },
+    )
+
+    assert rv.status_code == 302
+    assert not os.path.lexists(old_alias)
+    assert os.path.islink(new_alias)
+    assert os.readlink(new_alias) == "../target/page.md"
+    assert storage.exists("target/page.md")
+
+
+@pytest.mark.parametrize(
+    ("new_pagename", "new_filename", "expected_target"),
+    [
+        ("Moved", "moved.md", "target/page.md"),
+        (
+            "Archive/Nested/Moved",
+            "archive/nested/moved.md",
+            "../../target/page.md",
+        ),
+    ],
+)
+def test_internal_page_symlink_rename_across_directories_preserves_target(
+    test_client,
+    internal_page_symlink,
+    new_pagename,
+    new_filename,
+    expected_target,
+):
+    storage = internal_page_symlink
+    old_alias = os.path.join(storage.path, "shortcuts/link.md")
+    new_alias = os.path.join(storage.path, new_filename)
+
+    rv = test_client.post(
+        "/Shortcuts/Link/rename",
+        data={"new_pagename": new_pagename, "message": "Move shortcut"},
+    )
+
+    assert rv.status_code == 302
+    assert not os.path.lexists(old_alias)
+    assert os.path.islink(new_alias)
+    assert os.readlink(new_alias) == expected_target
+    assert storage.load(new_filename) == "# Target\n"
+    assert storage.repo.git.show(f"HEAD:{new_filename}") == expected_target
+    assert storage.exists("target/page.md")
+
+    rv = test_client.get(f"/{new_pagename}")
+    assert rv.status_code == 302
+    assert rv.headers["Location"] == "/Target/Page"
+
+
+def test_internal_page_symlink_delete_deletes_alias_only(
+    test_client, internal_page_symlink
+):
+    storage = internal_page_symlink
+    alias = os.path.join(storage.path, "shortcuts/link.md")
+
+    rv = test_client.post(
+        "/Shortcuts/Link/delete",
+        data={"message": "Delete shortcut"},
+    )
+
+    assert rv.status_code == 302
+    assert not os.path.lexists(alias)
+    assert storage.exists("target/page.md")
+
+
+@pytest.mark.parametrize(
+    ("path", "filename"),
+    [
+        ("Target/Page", "target/page.md"),
+        ("Shortcuts/Link", "shortcuts/link.md"),
+    ],
+)
+@pytest.mark.parametrize("with_attachment", [False, True])
+def test_rename_into_symlinked_directory_outside_repository(
+    test_client,
+    internal_page_symlink,
+    tmp_path,
+    path,
+    filename,
+    with_attachment,
+):
+    storage = internal_page_symlink
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.symlink(str(outside), os.path.join(storage.path, "out"))
+    if with_attachment:
+        storage.store(
+            filename[:-3] + "/file.txt",
+            content="attachment\n",
+            author=("Test", "test@example.org"),
+        )
+
+    rv = test_client.post(
+        f"/{path}/rename",
+        data={"new_pagename": "Out/Moved", "message": "Move"},
+    )
+
+    assert rv.status_code == 200
+    assert "Renaming failed" in rv.data.decode()
+    assert list(outside.iterdir()) == []
+    assert os.path.lexists(os.path.join(storage.path, filename))
+    assert storage.load("target/page.md") == "# Target\n"
+    assert not storage.repo.is_dirty()
+
+
 def test_create_form(test_client):
     result = test_client.get("/-/create")
     html = result.data.decode()
@@ -83,6 +664,10 @@ def test_create_page(test_client, req_ctx):
     # check textarea
     assert "<textarea" in html
     assert 'name="content_editor"' in html
+    # check the preview and the live preview buttons
+    assert 'id="preview_btn"' in html
+    assert 'id="split_btn"' in html
+    assert 'id="editor_split"' in html
     # test save
     html = test_client.post(
         "/{}/save".format(pagename),
@@ -118,6 +703,10 @@ def test_create_page_notlower(test_client, req_ctx):
     # check textarea
     assert "<textarea" in html
     assert 'name="content_editor"' in html
+    # check the preview and the live preview buttons
+    assert 'id="preview_btn"' in html
+    assert 'id="split_btn"' in html
+    assert 'id="editor_split"' in html
     # test save
     html = test_client.post(
         "/{}/save".format(pagename),
@@ -365,6 +954,162 @@ def test_blame_and_history_and_diff(test_client):
     assert revision[1] in html
 
 
+def test_diff_shows_revision_metadata(test_client):
+    pagename = "Diff Metadata Test"
+    save_shortcut(test_client, pagename, "aaa", "first diff message")
+    save_shortcut(test_client, pagename, "bbb", "second diff message")
+    html = test_client.get("/{}/history".format(pagename)).data.decode()
+    revision = re.findall(
+        r"class=\"btn revision-small\">([A-z0-9]+)</a>", html
+    )
+    assert len(revision) == 2
+    rv = test_client.get(
+        "/{}/diff/{}/{}".format(pagename, revision[1], revision[0])
+    )
+    assert rv.status_code == 200
+    html = rv.data.decode()
+    messages = re.findall(
+        r"<td class=\"text-wrap diff-revision-message\">([^<]*)</td>", html
+    )
+    assert messages == ["first diff message", "second diff message"]
+    assert html.count("class=\"datetime\"") == 2
+
+
+def get_history_revisions(test_client, pagename):
+    html = test_client.get("/{}/history".format(pagename)).data.decode()
+    return re.findall(r"class=\"btn revision-small\">([A-z0-9]+)</a>", html)
+
+
+def test_history_compare_revisions(test_client):
+    pagename = "HistoryCompareTest"
+    for i in range(3):
+        save_shortcut(test_client, pagename, "line {}".format(i), str(i))
+    # newest first
+    r = get_history_revisions(test_client, pagename)
+    assert len(r) == 3
+    url = "/{}/history".format(pagename)
+    # same revision twice: no redirect, but a toast
+    rv = test_client.post(url, data={"rev_a": r[1], "rev_b": r[1]})
+    assert rv.status_code == 200
+    assert "Please select two different revisions." in rv.data.decode()
+    # only one revision selected
+    rv = test_client.post(url, data={"rev_a": r[1]})
+    assert rv.status_code == 200
+    assert "Please select two revisions to compare." in rv.data.decode()
+    # correct order
+    rv = test_client.post(url, data={"rev_a": r[2], "rev_b": r[0]})
+    assert rv.status_code == 302
+    assert rv.location.endswith("/{}/diff/{}/{}".format(pagename, r[2], r[0]))
+    # swapped order: the older revision ends up as rev_a
+    rv = test_client.post(url, data={"rev_a": r[0], "rev_b": r[2]})
+    assert rv.status_code == 302
+    assert rv.location.endswith("/{}/diff/{}/{}".format(pagename, r[2], r[0]))
+    # plain GET shows no toast
+    html = test_client.get(url).data.decode()
+    assert "Please select" not in html
+
+
+def test_diff_previous_and_next_edit(test_client):
+    pagename = "DiffNavigationTest"
+    for i in range(4):
+        save_shortcut(test_client, pagename, "line {}".format(i), str(i))
+    # newest first
+    r = get_history_revisions(test_client, pagename)
+    assert len(r) == 4
+
+    def nav(rev_a, rev_b):
+        html = test_client.get(
+            "/{}/diff/{}/{}".format(pagename, rev_a, rev_b)
+        ).data.decode()
+        prev_url = re.findall(
+            r"<a class=\"btn\" href=\"([^\"]*)\"><i [^>]*></i> Previous edit",
+            html,
+        )
+        next_url = re.findall(
+            r"<a class=\"btn\" href=\"([^\"]*)\">Next edit", html
+        )
+        return (
+            prev_url[0] if prev_url else None,
+            next_url[0] if next_url else None,
+        )
+
+    url = "/{}/diff/{}/{}".format
+    # oldest diff: no previous edit
+    assert nav(r[3], r[2]) == (None, url(pagename, r[2], r[1]))
+    # middle diff
+    assert nav(r[2], r[1]) == (
+        url(pagename, r[3], r[2]),
+        url(pagename, r[1], r[0]),
+    )
+    # newest diff: no next edit
+    assert nav(r[1], r[0]) == (url(pagename, r[2], r[1]), None)
+    # a diff spanning several edits steps out of both ends
+    assert nav(r[2], r[0]) == (url(pagename, r[3], r[2]), None)
+    # reversed order is treated the same
+    assert nav(r[1], r[2]) == (
+        url(pagename, r[3], r[2]),
+        url(pagename, r[1], r[0]),
+    )
+    # a diff spanning the whole history shows both buttons disabled
+    assert nav(r[3], r[0]) == (None, None)
+    html = test_client.get(url(pagename, r[3], r[0])).data.decode()
+    assert '<span class="btn disabled" aria-disabled="true"><i' in html
+    assert '<span class="btn disabled" aria-disabled="true">Next edit' in html
+
+
+def test_diff_across_rename(test_client):
+    old_pagename, new_pagename = "Diff Rename Old", "Diff Rename New"
+    save_shortcut(test_client, old_pagename, "old content", "first")
+    save_shortcut(test_client, old_pagename, "changed content", "second")
+    test_client.post(
+        "/{}/rename".format(old_pagename),
+        data={"new_pagename": new_pagename, "message": ""},
+        follow_redirects=True,
+    )
+    save_shortcut(test_client, new_pagename, "newest content", "third")
+    r = get_history_revisions(test_client, new_pagename)
+    assert len(r) == 4
+    # the diff before the rename shows the old filename
+    html = test_client.get(
+        "/{}/diff/{}/{}".format(new_pagename, r[3], r[2])
+    ).data.decode()
+    assert "diff rename old.md" in html
+    assert "changed content" in html
+
+
+def test_diff_side_by_side(test_client):
+    pagename = "DiffSideBySideTest"
+    save_shortcut(test_client, pagename, "# Head\n\nsimple <b>wiki", "1")
+    save_shortcut(test_client, pagename, "# Head\n\nsmall <b>wiki", "2")
+    r = get_history_revisions(test_client, pagename)
+    url = "/{}/diff/{}/{}".format(pagename, r[1], r[0])
+    # inline is the default
+    html = test_client.get(url).data.decode()
+    assert "diff-side-by-side" not in html
+    assert 'id="switch-side-by-side" autocomplete="off"\n' in html
+    # switch to side by side
+    html = test_client.get(url + "?view=side-by-side").data.decode()
+    assert '<table class="diff diff-side-by-side' in html
+    assert 'id="switch-side-by-side" autocomplete="off" checked' in html
+    # markdown is highlighted, changed words are marked
+    assert '<span class="gh"># Head</span>' in html
+    assert (
+        '<span class="diff-word removed">simple</span> &lt;b&gt;wiki' in html
+    )
+    assert '<span class="diff-word added">small</span> &lt;b&gt;wiki' in html
+    # the choice is remembered
+    html = test_client.get(url).data.decode()
+    assert '<table class="diff diff-side-by-side' in html
+    # invalid views are ignored
+    html = test_client.get(url + "?view=invalid").data.decode()
+    assert '<table class="diff diff-side-by-side' in html
+    # switch back to inline
+    html = test_client.get(url + "?view=inline").data.decode()
+    assert "diff-side-by-side" not in html
+    html = test_client.get(url).data.decode()
+    assert "diff-side-by-side" not in html
+
+
 def test_blame_and_history_404(test_client):
     pagename = "Does not exist"
     # check blame
@@ -430,6 +1175,31 @@ def test_search(test_client):
     )
     assert "Search matched 4 pages" in rv.data.decode()
     assert rv.status_code == 200
+
+
+@pytest.mark.parametrize("retain_case", [True, False])
+def test_search_pagename_xss(test_client, retain_case):
+    # the pagename in the search results must be escaped
+    saved = test_client.application.config["RETAIN_PAGE_NAME_CASE"]
+    test_client.application.config["RETAIN_PAGE_NAME_CASE"] = retain_case
+    try:
+        pagename = "<img src=x onerror=alert(1)>"
+        save_shortcut(test_client, pagename, "pocmarker", "xss test")
+        # match in the content
+        rv = test_client.get("/-/search/pocmarker")
+        assert rv.status_code == 200
+        html = rv.data.decode()
+        assert "Search matched 1 page" in html
+        assert "<img src=x" not in html.lower()
+        assert "&lt;img src=x" in html.lower()
+        # match in the pagename, the highlight span must survive
+        rv = test_client.get("/-/search/onerror")
+        assert rv.status_code == 200
+        html = rv.data.decode()
+        assert "<img src=x" not in html.lower()
+        assert '<span class="page-match">' in html
+    finally:
+        test_client.application.config["RETAIN_PAGE_NAME_CASE"] = saved
 
 
 def test_rename(test_client):
@@ -756,6 +1526,20 @@ def test_page_view_broken_utf8(test_client, create_app):
     html = rv.data.decode()
     assert "Storage error" in html
     assert "could not be decoded as text" in html
+
+
+def test_page_view_broken_utf8_escapes_filename(test_client, create_app):
+    """The filename in the storage error alert is HTML escaped."""
+    _create_broken_utf8_page(
+        create_app.storage, pagename="poc/<img src=x onerror=alert(1)>"
+    )
+    rv = test_client.get("/Poc/%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E")
+    assert rv.status_code == 200
+    html = rv.data.decode()
+    assert "Storage error" in html
+    assert "could not be decoded as text" in html
+    assert "<img src=x onerror=alert(1)>" not in html
+    assert "&lt;img src=x onerror=alert(1)&gt;" in html
 
 
 def test_page_view_broken_utf8_revision(test_client, create_app):

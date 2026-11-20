@@ -4,6 +4,9 @@
 import pytest
 from base64 import b64encode
 
+UPLOAD_PACK_REQUEST = "application/x-git-upload-pack-request"
+RECEIVE_PACK_REQUEST = "application/x-git-receive-pack-request"
+
 
 @pytest.fixture
 def create_app_with_git(create_app):
@@ -109,15 +112,20 @@ def test_git_pack(create_app_with_git, test_client_with_git):
     )
     rv = test_client_with_git.post(
         "/.git/git-upload-pack",
+        content_type=UPLOAD_PACK_REQUEST,
     )
     # We expect 500 here, since we are not providing the correct data=b'00a8want ... multi_ack_detailed no-done side-band-64k thin-pack ofs-delta deepen-since deepen-not ...'
     assert rv.status_code == 500
 
-    rv = test_client_with_git.post("/.git/git-receive-pack")
+    rv = test_client_with_git.post(
+        "/.git/git-receive-pack", content_type=RECEIVE_PACK_REQUEST
+    )
     assert rv.status_code == 500
 
     create_app_with_git.config["ATTACHMENT_ACCESS"] = "ADMIN"
-    rv = test_client_with_git.post("/.git/git-upload-pack")
+    rv = test_client_with_git.post(
+        "/.git/git-upload-pack", content_type=UPLOAD_PACK_REQUEST
+    )
     assert rv.status_code == 500
 
     rv = test_client_with_git.post("/.git/git-receive-pack")
@@ -185,6 +193,7 @@ def test_git_pack_auth_user(app_with_user):
         allow_upload=False,  # pyright: ignore
         is_approved=True,  # pyright: ignore
         is_admin=False,  # pyright: ignore
+        email_confirmed=True,  # pyright: ignore
     )
     db.session.add(user)
     db.session.commit()
@@ -205,6 +214,7 @@ def test_git_pack_auth_user(app_with_user):
     rv = test_client.post(
         "/.git/git-receive-pack",
         headers={"Authorization": f"Basic {admin_credentials}"},
+        content_type=RECEIVE_PACK_REQUEST,
     )
     # 500 is in this test okay, since we are not sending the correct data
     assert rv.status_code == 500
@@ -238,3 +248,180 @@ def test_git_pack_auth_user(app_with_user):
     app_with_user.config["READ_ACCESS"] = "ANONYMOUS"
     app_with_user.config["WRITE_ACCESS"] = "ANONYMOUS"
     app_with_user.config["ATTACHMENT_ACCESS"] = "ANONYMOUS"
+
+
+def test_git_push_symlink_outside_repository(
+    create_app_with_git, admin_client, tmpdir
+):
+    import os
+    import subprocess
+    from otterwiki.server import storage
+    from otterwiki.remote import GitHttpServer
+
+    def git(*args, cwd=None):
+        subprocess.run(
+            ["git", "-c", "user.name=x", "-c", "user.email=x@x", *args],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+        )
+
+    # configures receive.denyCurrentBranch=updateInstead
+    GitHttpServer(storage.path)
+    secret = tmpdir.join("secret.txt")
+    secret.write("secret\n")
+    clone = str(tmpdir.join("clone"))
+    git("clone", storage.path, clone)
+    os.symlink(str(secret), os.path.join(clone, "leak.md"))
+    git("add", "leak.md", cwd=clone)
+    git("commit", "-m", "symlink", cwd=clone)
+    git("push", "origin", "HEAD", cwd=clone)
+    assert os.path.islink(os.path.join(storage.path, "leak.md"))
+
+    rv = admin_client.get("/Leak/source?raw")
+    assert rv.status_code == 404
+    assert "secret" not in rv.data.decode()
+    rv = admin_client.post(
+        "/Leak/save", data={"content": "overwritten", "commit": "x"}
+    )
+    assert rv.status_code == 403
+    assert secret.read() == "secret\n"
+
+
+def test_git_auth_email_not_confirmed(app_with_user):
+    from otterwiki.auth import SimpleAuth, generate_password_hash, db
+    from datetime import datetime
+
+    app_with_user.config["GIT_WEB_SERVER"] = True
+    app_with_user.config["EMAIL_NEEDS_CONFIRMATION"] = True
+    app_with_user.config["READ_ACCESS"] = "REGISTERED"
+    app_with_user.config["WRITE_ACCESS"] = "REGISTERED"
+    app_with_user.config["ATTACHMENT_ACCESS"] = "REGISTERED"
+    # create a user with an unconfirmed email address
+    user = SimpleAuth.User(
+        name="Unconfirmed User",  # pyright: ignore
+        email="unconfirmed@user.org",  # pyright: ignore
+        password_hash=generate_password_hash(
+            "password1234", method="scrypt"
+        ),  # pyright: ignore
+        first_seen=datetime.now(),  # pyright: ignore
+        last_seen=datetime.now(),  # pyright: ignore
+        is_approved=True,  # pyright: ignore
+        is_admin=False,  # pyright: ignore
+        email_confirmed=False,  # pyright: ignore
+    )
+    db.session.add(user)
+    db.session.commit()
+
+    test_client = app_with_user.test_client()
+    user_credentials = b64encode(b"unconfirmed@user.org:password1234").decode(
+        'utf-8'
+    )
+
+    for service in ["git-upload-pack", "git-receive-pack"]:
+        rv = test_client.get(
+            f"/.git/info/refs?service={service}",
+            headers={"Authorization": f"Basic {user_credentials}"},
+        )
+        assert rv.status_code == 403
+    rv = test_client.post(
+        "/.git/git-receive-pack",
+        headers={"Authorization": f"Basic {user_credentials}"},
+    )
+    assert rv.status_code == 403
+
+    # confirm the email address
+    user.email_confirmed = True
+    db.session.add(user)
+    db.session.commit()
+
+    for service in ["git-upload-pack", "git-receive-pack"]:
+        rv = test_client.get(
+            f"/.git/info/refs?service={service}",
+            headers={"Authorization": f"Basic {user_credentials}"},
+        )
+        assert rv.status_code == 200
+
+    # without the confirmation requirement the user has access
+    user.email_confirmed = False
+    db.session.add(user)
+    db.session.commit()
+    app_with_user.config["EMAIL_NEEDS_CONFIRMATION"] = False
+    rv = test_client.get(
+        "/.git/info/refs?service=git-upload-pack",
+        headers={"Authorization": f"Basic {user_credentials}"},
+    )
+    assert rv.status_code == 200
+
+    app_with_user.config["GIT_WEB_SERVER"] = False
+    app_with_user.config["EMAIL_NEEDS_CONFIRMATION"] = True
+    app_with_user.config["READ_ACCESS"] = "ANONYMOUS"
+    app_with_user.config["WRITE_ACCESS"] = "ANONYMOUS"
+    app_with_user.config["ATTACHMENT_ACCESS"] = "ANONYMOUS"
+
+
+def test_git_receive_pack_csrf_remember_cookie(app_with_user):
+    import subprocess
+    from otterwiki.server import storage
+    from otterwiki.remote import GitHttpServer
+
+    app_with_user.config["GIT_WEB_SERVER"] = True
+    # configures receive.denyCurrentBranch=updateInstead
+    GitHttpServer(storage.path)
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=storage.path,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    subprocess.run(["git", "branch", "probe"], cwd=storage.path, check=True)
+
+    client = app_with_user.test_client()
+    rv = client.post(
+        "/-/login",
+        data={
+            "email": "mail@example.org",
+            "password": "password1234",
+            "remember": "on",
+        },
+    )
+    cookies = rv.headers.getlist("Set-Cookie")
+    remember_token = [c for c in cookies if c.startswith("remember_token=")]
+    assert len(remember_token) == 1
+    # the remember me cookie must not be sent with cross-site requests
+    assert "SameSite=Lax" in remember_token[0]
+
+    # simulate a cross-site html form, that sends only the remember me cookie
+    attacker = app_with_user.test_client()
+    body = f"0066{sha} {'0' * 40} refs/heads/probe0000\r\n"
+    rv = attacker.post(
+        "/.git/git-receive-pack",
+        data=body,
+        headers={
+            "Cookie": remember_token[0].split(";")[0],
+            "Content-Type": "text/plain",
+            "Origin": "http://attacker.example",
+        },
+    )
+    assert rv.status_code == 415
+    branches = subprocess.run(
+        ["git", "branch"],
+        cwd=storage.path,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "probe" in branches
+
+    rv = attacker.post(
+        "/.git/git-upload-pack",
+        data="0000",
+        headers={
+            "Cookie": remember_token[0].split(";")[0],
+            "Content-Type": "text/plain",
+        },
+    )
+    assert rv.status_code == 415
+
+    app_with_user.config["GIT_WEB_SERVER"] = False

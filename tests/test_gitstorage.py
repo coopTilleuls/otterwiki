@@ -95,6 +95,30 @@ def test_log(storage):
     assert msg["message"] == message
 
 
+def test_log_merge_commit(storage):
+    author = ("Example Author", "mail@example.com")
+    assert storage.store(
+        "base.md", content="base", author=author, message="base"
+    )
+    main = storage.repo.active_branch.name
+    storage.repo.git.checkout("-b", "feature")
+    assert storage.store(
+        "feature.md", content="feature", author=author, message="feature"
+    )
+    storage.repo.git.checkout(main)
+    assert storage.store(
+        "main.md", content="main", author=author, message="main"
+    )
+    storage.repo.git.merge(
+        "feature", "--no-ff", "-m", "Merge branch 'feature'"
+    )
+    log = storage.log()
+    assert len(log) == 4
+    assert log[0]["message"] == "Merge branch 'feature'"
+    assert log[0]["files"] == []
+    assert log[1]["files"] in (["main.md"], ["feature.md"])
+
+
 def test_revert(storage):
     author = ("Example Author", "mail@example.com")
     filename = "test_revert.md"
@@ -593,3 +617,171 @@ def test_restore_handles_non_ascii_paths(storage):
     storage.restore([filename])
 
     assert storage.load(filename) == "original\n"
+
+
+@pytest.fixture
+def outside_file():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "secret.txt")
+        with open(path, "w") as f:
+            f.write("secret\n")
+        yield path
+
+
+def test_symlink_outside_repository(storage, outside_file):
+    author = ("Example Author", "mail@example.com")
+    os.symlink(outside_file, os.path.join(storage.path, "leak.md"))
+    assert storage.exists("leak.md") is False
+    with pytest.raises(gitstorage.StorageNotFound):
+        storage.load("leak.md")
+    with pytest.raises(gitstorage.StorageUnsafePath):
+        storage.size("leak.md")
+    with pytest.raises(gitstorage.StorageUnsafePath):
+        storage.store("leak.md", content="overwritten\n", author=author)
+    with pytest.raises(gitstorage.StorageUnsafePath):
+        storage.canonical_filename("leak.md")
+    with open(outside_file) as f:
+        assert f.read() == "secret\n"
+
+
+def test_symlinked_directory_outside_repository(storage, outside_file):
+    author = ("Example Author", "mail@example.com")
+    os.symlink(
+        os.path.dirname(outside_file), os.path.join(storage.path, "subdir")
+    )
+    with pytest.raises(gitstorage.StorageNotFound):
+        storage.load("subdir/secret.txt")
+    with pytest.raises(gitstorage.StorageUnsafePath):
+        storage.store("subdir/new.md", content="new\n", author=author)
+    assert not os.path.exists(
+        os.path.join(os.path.dirname(outside_file), "new.md")
+    )
+
+
+@pytest.mark.parametrize("preserve_symlink_target", [False, True])
+def test_rename_into_symlinked_directory_outside_repository(
+    storage, outside_file, preserve_symlink_target
+):
+    author = ("Example Author", "mail@example.com")
+    outside_dir = os.path.dirname(outside_file)
+    storage.store("target.md", content="target\n", author=author)
+    os.makedirs(os.path.join(storage.path, "folder"))
+    os.symlink("../target.md", os.path.join(storage.path, "folder/link.md"))
+    storage.commit(["folder/link.md"], message="link", author=author)
+    os.symlink(outside_dir, os.path.join(storage.path, "subdir"))
+    for filename in ["target.md", "folder/link.md"]:
+        with pytest.raises(gitstorage.StorageUnsafePath):
+            storage.rename(
+                filename,
+                "subdir/moved.md",
+                author=author,
+                preserve_symlink_target=preserve_symlink_target,
+            )
+    with pytest.raises(gitstorage.StorageUnsafePath):
+        storage.rename("folder", "subdir/folder", author=author)
+    # nothing was moved or created outside the repository
+    assert sorted(os.listdir(outside_dir)) == ["secret.txt"]
+    assert storage.load("target.md") == "target\n"
+    assert os.readlink(os.path.join(storage.path, "folder/link.md")) == (
+        "../target.md"
+    )
+    assert not storage.repo.is_dirty()
+
+
+def test_rename_into_git_directory(storage):
+    author = ("Example Author", "mail@example.com")
+    storage.store("page.md", content="page\n", author=author)
+    with pytest.raises(gitstorage.StorageUnsafePath):
+        storage.rename("page.md", ".git/hooks/page.md", author=author)
+    assert storage.load("page.md") == "page\n"
+    assert not os.path.exists(os.path.join(storage.path, ".git/hooks/page.md"))
+    assert not storage.repo.is_dirty()
+
+
+def test_symlink_into_git_directory(storage):
+    author = ("Example Author", "mail@example.com")
+    storage.store("page.md", content="page\n", author=author)
+    os.symlink(".git/config", os.path.join(storage.path, "config.md"))
+    with pytest.raises(gitstorage.StorageNotFound):
+        storage.load("config.md")
+    with pytest.raises(gitstorage.StorageUnsafePath):
+        storage.store("config.md", content="[core]\n", author=author)
+    with pytest.raises(gitstorage.StorageNotFound):
+        storage.load(".git/config")
+    # .git stays protected even if external symlinks are allowed
+    storage.allow_external_symlinks = True
+    with pytest.raises(gitstorage.StorageNotFound):
+        storage.load("config.md")
+
+
+def test_symlink_inside_repository(storage):
+    author = ("Example Author", "mail@example.com")
+    storage.store("target.md", content="target\n", author=author)
+    os.symlink("target.md", os.path.join(storage.path, "link.md"))
+    assert storage.exists("link.md") is True
+    assert storage.load("link.md") == "target\n"
+
+
+def test_gc(storage):
+    author = ("Example Author", "mail@example.com")
+    storage.store("page.md", content="page\n", author=author)
+    assert "packs: 0" in storage.count_objects()
+    storage.gc()
+    stats = storage.count_objects()
+    assert "count: 0" in stats
+    assert "packs: 1" in stats
+    # the page is still there
+    assert storage.load("page.md") == "page\n"
+
+
+def test_allow_external_symlinks(storage, outside_file):
+    storage.allow_external_symlinks = True
+    os.symlink(outside_file, os.path.join(storage.path, "shared.md"))
+    assert storage.load("shared.md") == "secret\n"
+    assert storage.canonical_filename("shared.md") == "shared.md"
+
+
+def test_canonical_filename_resolves_internal_symlink(storage):
+    author = ("Example Author", "mail@example.com")
+    storage.store(
+        "target/page.md",
+        content="target\n",
+        author=author,
+    )
+
+    os.makedirs(os.path.join(storage.path, "shortcuts"), exist_ok=True)
+    os.symlink(
+        "../target/page.md",
+        os.path.join(storage.path, "shortcuts/link.md"),
+    )
+
+    assert storage.canonical_filename("shortcuts/link.md") == "target/page.md"
+
+
+def test_islink(storage, outside_file):
+    author = ("Test", "test@example.org")
+
+    storage.store("target.md", content="target\n", author=author)
+    os.mkdir(os.path.join(storage.path, "folder"))
+
+    os.symlink("target.md", os.path.join(storage.path, "link.md"))
+    os.symlink("folder", os.path.join(storage.path, "dirlink"))
+    os.symlink("missing.md", os.path.join(storage.path, "broken.md"))
+    os.symlink(".git/config", os.path.join(storage.path, "gitlink"))
+    os.symlink(outside_file, os.path.join(storage.path, "external"))
+
+    assert storage.islink("link.md") is True
+    assert storage.islink("dirlink") is True
+    assert storage.islink("broken.md") is True
+
+    assert storage.islink("target.md") is False
+    assert storage.islink("folder") is False
+    assert storage.islink("missing.md") is False
+
+    assert storage.islink("gitlink") is False
+    assert storage.islink("external") is False
+
+    storage.allow_external_symlinks = True
+
+    assert storage.islink("external") is True
+    assert storage.islink("gitlink") is False

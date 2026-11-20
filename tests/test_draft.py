@@ -112,3 +112,361 @@ def test_draft_discard(app_with_user, test_client):
     html = rv.data.decode()
     # check that the page content is back to the default for new pages
     assert "# Test_Draft_Discard" in html
+
+
+def test_draft_unchanged_is_discarded(app_with_user, test_client):
+    assert app_with_user
+    from otterwiki.models import Drafts
+
+    # login the client
+    login(test_client)
+
+    pagepath = "test_draft_unchanged"
+    content = "# Unchanged\n\nfirst line\n"
+    rv = test_client.post(
+        "/{}/save".format(pagepath),
+        data={"content": content, "commit": "initial commit"},
+        follow_redirects=True,
+    )
+    assert rv.status_code == 200
+
+    # store a draft with changes
+    create_draft(test_client, pagepath, content + "second line\n")
+    assert len(Drafts.query.filter_by(pagepath=pagepath).all()) == 1
+
+    # revert the changes, the draft is identical to the stored page
+    rv = test_client.post(
+        "/{}/draft".format(pagepath),
+        data={"content": content.replace("\n", "\r\n") + "\r\n"},
+    )
+    assert rv.status_code == 200
+    assert rv.json["status"] == "draft discarded"
+    assert len(Drafts.query.filter_by(pagepath=pagepath).all()) == 0
+
+    # the editor opens without the draft warning
+    rv = test_client.get("/{}/edit".format(pagepath))
+    assert rv.status_code == 200
+    html = rv.data.decode()
+    assert "Continue editing draft?".lower() not in html.lower()
+
+
+def test_draft_unchanged_new_page_is_discarded(app_with_user, test_client):
+    assert app_with_user
+    from otterwiki.models import Drafts
+
+    # login the client
+    login(test_client)
+
+    pagepath = "test_draft_unchanged_new_page"
+    # the content the editor starts with for new pages
+    rv = test_client.post(
+        "/{}/draft".format(pagepath),
+        data={"content": "# Test_Draft_Unchanged_New_Page\n\n"},
+    )
+    assert rv.status_code == 200
+    assert rv.json["status"] == "draft discarded"
+    assert len(Drafts.query.filter_by(pagepath=pagepath).all()) == 0
+
+    create_draft(test_client, pagepath, "# Test_Draft_Unchanged_New_Page\n\nX")
+    assert len(Drafts.query.filter_by(pagepath=pagepath).all()) == 1
+    # clean up
+    Drafts.query.filter_by(pagepath=pagepath).delete()
+
+
+def test_discard_draft(app_with_user, test_client):
+    assert app_with_user
+    from otterwiki.models import Drafts
+
+    # login the client
+    login(test_client)
+
+    pagepath = "test_discard_draft"
+    create_draft(test_client, pagepath, "test\ntest\n")
+    assert len(Drafts.query.filter_by(pagepath=pagepath).all()) == 1
+
+    rv = test_client.post("/{}/draft/discard".format(pagepath))
+    assert rv.status_code == 200
+    assert rv.json["status"] == "draft discarded"
+    assert len(Drafts.query.filter_by(pagepath=pagepath).all()) == 0
+
+    # discarding a non existing draft is fine
+    rv = test_client.post("/{}/draft/discard".format(pagepath))
+    assert rv.status_code == 200
+
+
+def save_page(test_client, pagepath, content, commit="commit"):
+    rv = test_client.post(
+        "/{}/save".format(pagepath),
+        data={"content": content, "commit": commit},
+        follow_redirects=True,
+    )
+    assert rv.status_code == 200
+
+
+def page_revision(pagepath):
+    from otterwiki.server import storage
+    from otterwiki.helper import get_filename
+
+    return storage.metadata(get_filename(pagepath))["revision"]
+
+
+def store_as_someone_else(pagepath, content, message):
+    from otterwiki.server import storage
+    from otterwiki.helper import get_filename
+
+    assert storage.store(
+        filename=get_filename(pagepath),
+        content=content,
+        message=message,
+        author=("Someone Else", "someone@example.org"),
+    )
+
+
+def diff_headers(html):
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+    return [
+        " ".join(th.get_text().split())
+        for th in soup.select("#draft-diff th.diff-header:not(.diff-buttons)")
+    ]
+
+
+def diff_buttons(html):
+    """the labels of the buttons above the left and the right side"""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+    return [
+        button["value"]
+        for button in soup.select("#draft-diff th.diff-buttons input.btn")
+    ]
+
+
+def post_draft(test_client, pagepath, content, revision):
+    rv = test_client.post(
+        "/{}/draft".format(pagepath),
+        data={"content": content, "revision": revision},
+    )
+    assert rv.status_code == 200
+    assert rv.json["status"] == "draft saved"
+
+
+def test_draft_diff(app_with_user, test_client):
+    assert app_with_user
+    login(test_client)
+
+    pagepath = "test_draft_diff"
+    save_page(test_client, pagepath, "# Diff\n\nfirst line\n")
+    post_draft(
+        test_client,
+        pagepath,
+        "# Diff\n\nfirst line\nline from the **draft**\n",
+        page_revision(pagepath),
+    )
+
+    rv = test_client.get("/{}/edit".format(pagepath))
+    assert rv.status_code == 200
+    html = rv.data.decode()
+    assert "Continue editing draft?" in html
+    assert 'class="diff diff-side-by-side highlight" id="draft-diff"' in html
+    # the added line has no counterpart
+    assert '<td class="value empty"></td>' in html
+    # the markdown is highlighted
+    assert (
+        '<td class="value added">line from the '
+        '<span class="gs">**draft**</span></td>'
+    ) in html
+    assert '<span class="gh"># Diff</span>' in html
+    assert 'id="draft-outdated"' not in html
+    headers = diff_headers(html)
+    assert headers[0] == "Latest saved version {}".format(
+        page_revision(pagepath)
+    )
+    assert headers[1].startswith("Your draft saved")
+    # the buttons are placed above the side they keep
+    assert diff_buttons(html) == ["Discard draft", "Continue editing draft"]
+
+
+def test_draft_outdated(app_with_user, test_client):
+    assert app_with_user
+    login(test_client)
+
+    pagepath = "test_draft_outdated"
+    save_page(test_client, pagepath, "# Outdated\n\nfirst line\n")
+    base_revision = page_revision(pagepath)
+    post_draft(
+        test_client,
+        pagepath,
+        "# Outdated\n\nfirst line\nline from the draft\n",
+        base_revision,
+    )
+    # someone else changes the page
+    store_as_someone_else(
+        pagepath,
+        "# Outdated\n\nfirst line\nline from someone else\n",
+        "change by someone else",
+    )
+    current_revision = page_revision(pagepath)
+    assert current_revision != base_revision
+
+    rv = test_client.get("/{}/edit".format(pagepath))
+    assert rv.status_code == 200
+    html = rv.data.decode()
+    assert 'id="draft-outdated"' in html
+    assert "has been changed since the draft was started" in html
+    assert diff_headers(html)[0] == (
+        "Version the draft is based on {}".format(base_revision)
+    )
+    # discarding doesn't restore the left side, but the latest version
+    assert diff_buttons(html) == [
+        "Discard draft, edit latest version",
+        "Continue editing draft",
+    ]
+    assert "change by someone else" in html
+    assert (
+        "/{}/diff/{}/{}".format(pagepath, base_revision, current_revision)
+        in html
+    )
+    # the diff shows only the changes made in the draft
+    diff = html.split('id="draft-diff"')[1].split("</table>")[0]
+    assert "line from the draft" in diff
+    assert "line from someone else" not in diff
+
+    # continuing the draft keeps the revision the draft is based on
+    rv = test_client.post(
+        "/{}/edit".format(pagepath),
+        data={"draft": "edit"},
+        follow_redirects=True,
+    )
+    assert rv.status_code == 200
+    html = rv.data.decode()
+    assert 'formData.append("revision", "{}")'.format(base_revision) in html
+    assert "has been changed since the draft was started" in html
+
+
+def test_draft_outdated_new_page(app_with_user, test_client):
+    assert app_with_user
+    login(test_client)
+
+    pagepath = "test_draft_outdated_new_page"
+    # draft of a page that doesn't exist yet
+    post_draft(test_client, pagepath, "# New\n\nfrom the draft\n", "")
+    # someone else creates the page
+    store_as_someone_else(
+        pagepath, "# New\n\ncreated meanwhile\n", "create page"
+    )
+
+    rv = test_client.get("/{}/edit".format(pagepath))
+    assert rv.status_code == 200
+    html = rv.data.decode()
+    assert "has been changed since the draft was started" in html
+    assert diff_headers(html)[0] == "New page"
+    diff = html.split('id="draft-diff"')[1].split("</table>")[0]
+    assert "from the draft" in diff
+    assert "created meanwhile" not in diff
+
+
+def test_draft_outdated_deleted_page(app_with_user, test_client):
+    assert app_with_user
+    login(test_client)
+
+    pagepath = "test_draft_outdated_deleted"
+    save_page(test_client, pagepath, "# Deleted\n\nfirst line\n")
+    post_draft(
+        test_client,
+        pagepath,
+        "# Deleted\n\nfirst line\nfrom the draft\n",
+        page_revision(pagepath),
+    )
+    rv = test_client.post(
+        "/{}/delete".format(pagepath),
+        data={"message": "delete page"},
+        follow_redirects=True,
+    )
+    assert rv.status_code == 200
+
+    rv = test_client.get("/{}/edit".format(pagepath))
+    assert rv.status_code == 200
+    html = rv.data.decode()
+    assert "has been deleted since the draft was started" in html
+    assert diff_headers(html)[0].startswith("Version the draft is based on ")
+    assert diff_buttons(html)[0] == "Discard draft, start a new page"
+    diff = html.split('id="draft-diff"')[1].split("</table>")[0]
+    assert "from the draft" in diff
+
+
+def test_draft_unknown_revision(app_with_user, test_client):
+    assert app_with_user
+    login(test_client)
+
+    pagepath = "test_draft_unknown_revision"
+    save_page(test_client, pagepath, "# Unknown\n\nfirst line\n")
+    post_draft(
+        test_client, pagepath, "# Unknown\n\nfrom the draft\n", "abcdef"
+    )
+
+    rv = test_client.get("/{}/edit".format(pagepath))
+    assert rv.status_code == 200
+    html = rv.data.decode()
+    assert "can not be found in the history" in html
+    assert diff_headers(html)[0] == "Latest saved version {}".format(
+        page_revision(pagepath)
+    )
+    assert "Compared to the stored version" in html
+    assert "from the draft" in html
+
+
+def test_draft_diff_words_and_context(app_with_user, test_client):
+    assert app_with_user
+    login(test_client)
+
+    pagepath = "test_draft_diff_words"
+    paragraph = (
+        "Lorem ipsum dolor sit amet, consectetur adipiscing elit. " * 10
+    )
+    content = "# Words\n\n{p}\n\n{p}\n".format(p=paragraph.strip())
+    save_page(test_client, pagepath, content)
+    post_draft(
+        test_client,
+        pagepath,
+        content.replace("elit. Lorem", "elit. <Abc> Lorem", 1),
+        page_revision(pagepath),
+    )
+
+    rv = test_client.get("/{}/edit".format(pagepath))
+    assert rv.status_code == 200
+    html = rv.data.decode()
+    diff = html.split('id="draft-diff"')[1].split("</table>")[0]
+    # the changed words are marked and escaped
+    assert '<span class="diff-word added"> &lt;Abc&gt;</span>' in diff
+    # the partially changed line is marked by its line number only
+    assert 'linenumber added partial">' in diff
+    assert 'class="value added"' not in diff
+    assert 'class="value removed"' not in diff
+    # the unchanged paragraph is a shortened context line
+    assert '<tr class="diff-context">' in diff
+    assert '<div class="diff-clamp">' in diff
+
+
+def test_draft_without_changes_shows_buttons(app_with_user, test_client):
+    assert app_with_user
+    login(test_client)
+
+    pagepath = "test_draft_without_changes"
+    content = "# Without changes\n\nfirst line\n"
+    save_page(test_client, pagepath, content)
+    base_revision = page_revision(pagepath)
+    store_as_someone_else(
+        pagepath, content + "line from someone else\n", "add a line"
+    )
+    # a draft identical to the version it is based on
+    post_draft(test_client, pagepath, content, base_revision)
+
+    rv = test_client.get("/{}/edit".format(pagepath))
+    assert rv.status_code == 200
+    html = rv.data.decode()
+    assert "The draft has no changes." in html
+    assert 'id="draft-diff"' not in html
+    assert 'value="Continue editing draft"' in html
+    assert 'value="Discard draft, edit latest version"' in html

@@ -184,6 +184,51 @@ Content
         assert "&quot;" in html
 
 
+@pytest.mark.parametrize("name", ["InfoBox", "ImageFrame", "Figure"])
+@pytest.mark.parametrize(
+    "options",
+    [
+        "|style=background-image:url(javascript:alert(1))",
+        "|style=behavior:url(x.htc)",
+        "|style=-moz-binding:url(x)",
+        "|style=width:expression(alert(1))",
+        "|style=width:expr/**/ession(alert(1))",
+        r"|style=background:url(\6a avascript:alert(1))",
+        "|width=expression(alert(1))",
+        # a css comment that spans the width and the style fragment
+        "|width=ex/*\n|style=*/pression(alert(1))",
+    ],
+)
+def test_embedding_dangerous_style_is_dropped(name, options):
+    html, _, _ = render.markdown(f"{{{{{name}\n{options}\nContent\n}}}}\n")
+    soup = BeautifulSoup(html, "html.parser")
+    assert soup.find(style=True) is None
+    assert "Content" in soup.get_text()
+
+
+@pytest.mark.parametrize(
+    "name, options",
+    [
+        ("InfoBox", "|text-align=expression(alert(1))"),
+        ("ImageFrame", "|text-align=expression(alert(1))"),
+        ("Figure", "|height=expression(alert(1))"),
+    ],
+)
+def test_embedding_dangerous_style_in_layout_options(name, options):
+    html, _, _ = render.markdown(f"{{{{{name}\n{options}\nContent\n}}}}\n")
+    assert "expression" not in html
+
+
+@pytest.mark.parametrize("name", ["InfoBox", "ImageFrame", "Figure"])
+def test_embedding_harmless_style_is_kept(name):
+    md = (
+        f"{{{{{name}\n|style=background:url(/a.png);color:red\nContent\n}}}}\n"
+    )
+    html, _, _ = render.markdown(md)
+    tag = BeautifulSoup(html, "html.parser").find(style=True)
+    assert "background:url(/a.png);color:red" in tag["style"]
+
+
 def _assert_no_event_handlers(html):
     """Fail if any rendered tag carries an on* event-handler attribute."""
     soup = BeautifulSoup(html, "html.parser")
@@ -1094,6 +1139,30 @@ def test_datatable_csv_path_traversal_absolute_blocked(create_app):
         os.remove(secret_path)
 
 
+@pytest.mark.parametrize("src", ["/csvdir/", "sub"])
+def test_datatable_csv_directory_src_hides_path(create_app, src):
+    """A src that is a directory must not show the repository path."""
+    author = ("Test Author", "test@example.com")
+    create_app.storage.store(
+        "csvdir.md",
+        content=f"# Directory\n{{{{datatable\n|src={src}\n}}}}\n",
+        author=author,
+        message="directory page",
+    )
+    create_app.storage.store(
+        "csvdir/sub/data.csv",
+        content="Name;Score\nAlice;42\n",
+        author=author,
+        message="add csv",
+    )
+    client = create_app.test_client()
+    response = client.get("/Csvdir/view")
+    assert response.status_code == 200
+    html = response.data.decode()
+    assert "can not be read" in html
+    assert create_app.storage.path not in html
+
+
 def test_attachment_rejects_path_traversal(create_app):
     """The Attachment constructor guards against traversal for every caller,
     not just the DataTable embedding."""
@@ -1103,6 +1172,81 @@ def test_attachment_rejects_path_traversal(create_app):
     with create_app.app_context():
         with pytest.raises(StorageError):
             Attachment("somepage", "../../secret.cfg")
+
+
+def _write_secret_in_gitdir(create_app):
+    """Create a file in .git, which is not reachable as an attachment."""
+    secret_content = "gitdir-secret-value-12345\n"
+    with open(
+        os.path.join(create_app.storage.path, ".git", "secret"), "w"
+    ) as f:
+        f.write(secret_content)
+
+
+@pytest.mark.parametrize(
+    "src", ["/.git/secret", "/.GIT/secret", "/subdir/../.git/secret"]
+)
+def test_datatable_csv_git_directory_blocked(create_app, src):
+    """An absolute src must not read files in the .git directory."""
+    _write_secret_in_gitdir(create_app)
+    create_app.storage.store(
+        "csvgit.md",
+        content=f"# Git\n{{{{datatable\n|src={src}\n|header=false\n}}}}\n",
+        author=("Test Author", "test@example.com"),
+        message="git page",
+    )
+    html = create_app.test_client().get("/Csvgit/view").data.decode()
+    assert "gitdir-secret-value-12345" not in html
+    assert "<tt>datatable</tt> Error" in html
+
+
+def test_datatable_csv_symlink_to_git_directory_blocked(create_app):
+    """A symlink, e.g. pushed via git, must not lead into .git either."""
+    _write_secret_in_gitdir(create_app)
+    create_app.storage.store(
+        "csvgitlink.md",
+        content="# Git\n{{datatable\n|src=link.csv\n|header=false\n}}\n",
+        author=("Test Author", "test@example.com"),
+        message="git link page",
+    )
+    attachment_dir = os.path.join(create_app.storage.path, "csvgitlink")
+    os.mkdir(attachment_dir)
+    os.symlink("../.git/secret", os.path.join(attachment_dir, "link.csv"))
+    html = create_app.test_client().get("/Csvgitlink/view").data.decode()
+    assert "gitdir-secret-value-12345" not in html
+    assert "not found" in html
+
+
+def test_imageframe_git_directory_blocked(create_app):
+    """ImageFrame must not reveal which files exist in the .git directory."""
+    create_app.storage.store(
+        "framegit.md",
+        content="# Git\n{{ImageFrame\n|src=/.git/config\n}}\n",
+        author=("Test Author", "test@example.com"),
+        message="git frame page",
+    )
+    html = create_app.test_client().get("/Framegit/view").data.decode()
+    assert "not found" in html
+    assert (
+        "<img"
+        not in html.split('<article class="page">')[1].split("</article>")[0]
+    )
+
+
+@pytest.mark.parametrize("retain_case", [False, True])
+def test_attachment_git_directory_does_not_exist(create_app, retain_case):
+    """No spelling of .git is an attachment, on any filesystem."""
+    from otterwiki.wiki import Attachment
+
+    previous = create_app.config["RETAIN_PAGE_NAME_CASE"]
+    create_app.config["RETAIN_PAGE_NAME_CASE"] = retain_case
+    try:
+        with create_app.app_context():
+            assert not Attachment(".git", "config").exists()
+            assert not Attachment(".GIT", "config").exists()
+            assert not Attachment("page", "../.GIT/config").exists()
+    finally:
+        create_app.config["RETAIN_PAGE_NAME_CASE"] = previous
 
 
 def test_attachmentlist(create_app):
@@ -2130,6 +2274,61 @@ https://m.youtube.com/e/dQw4w9WgXcQ
     assert "dQw4w9WgXcQ" in iframe["src"]
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        'https://youtu.be/x"></iframe><svg onload="alert(1)">',
+        'https://youtu.be/x" onload="alert(1)',
+        'https://www.youtube.com/watch?v=x"></iframe><svg onload="alert(1)">',
+        'https://www.youtube.com/watch?v=x%22%3E%3C/iframe%3E'
+        '%3Csvg%20onload=alert(1)%3E',
+        'https://www.youtube.com/watch?v=x%22%20onload=%22alert(1)',
+        'https://www.youtube.com/embed/x" onload="alert(1)',
+        'https://www.youtube.com/e/x" onload="alert(1)',
+        'https://www.youtube-nocookie.com/embed/x" onload="alert(1)',
+    ],
+)
+def test_video_youtube_id_no_xss(url):
+    """A crafted YouTube video id must not break out of the iframe src
+    attribute and inject HTML or event handlers."""
+    html, _, _ = render.markdown(f"{{{{Video\n{url}\n}}}}\n")
+    _assert_no_event_handlers(html)
+    soup = BeautifulSoup(html, "html.parser")
+    assert soup.find("svg") is None
+    assert soup.find("iframe") is None
+
+
+def test_video_youtube_id_trailing_newline():
+    """A decoded trailing newline must not pass the video id validation."""
+    md = "{{Video\nhttps://www.youtube.com/watch?v=abc%0A\n}}\n"
+    html, _, _ = render.markdown(md)
+    assert BeautifulSoup(html, "html.parser").find("iframe") is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "javascript&#58;alert(1)",
+        "javascript&#x3a;alert(1)",
+        "javascript&colon;alert(1)",
+        "data&colon;text/html,x",
+    ],
+)
+def test_video_src_entity_does_not_pass_url_filter(url):
+    """An html entity in place of the colon must not get a harmful protocol
+    past safe_url()."""
+    html, _, _ = render.markdown(f"{{{{Video\n|src={url}\n}}}}\n")
+    src = BeautifulSoup(html, "html.parser").find("source")["src"]
+    assert not src.startswith(("javascript:", "data:"))
+
+
+def test_video_src_keeps_query_string():
+    md = "{{Video\n|src=/video.mp4?a=1&b=2\n}}\n"
+    html, _, _ = render.markdown(md)
+    src = BeautifulSoup(html, "html.parser").find("source")["src"]
+    assert src == "/video.mp4?a=1&b=2"
+
+
 def test_figure_basic():
     md = """
 {{Figure
@@ -2253,3 +2452,85 @@ Content
     figure = soup.find("div", class_="figure-embedding")
     content = figure.find("div", class_="figure-embedding-content")
     assert content.get("style") is None
+
+
+def test_oneline_embedding_with_pipe_options():
+    # a single-line embedding whose options contain a pipe must be parsed as
+    # an embedding and not shadowed by the (n)ptable rule (rendered as a
+    # paragraph). See the embedding_block rule ordering in renderer_plugins.
+    html, _, _ = render.markdown("{{InfoBox|caption=Hello|Answer=42}}\n")
+    soup = BeautifulSoup(html, "html.parser")
+    infobox = soup.find("div", class_="infobox")
+    assert infobox is not None
+    assert "{{InfoBox" not in html
+
+
+def test_oneline_embedding_ordering_keeps_tables_working():
+    # placing embedding_block ahead of the table rules must not break tables
+    md = "a | b\n--- | ---\n1 | 2\n"
+    html, _, _ = render.markdown(md)
+    soup = BeautifulSoup(html, "html.parser")
+    assert soup.find("table") is not None
+
+
+def test_embedding_error_is_escaped(create_app):
+    author = ("Test Author", "test@example.com")
+    create_app.storage.store(
+        "errorescape.md",
+        content="{{Datatable|src=<img src=x onerror=alert(1)>}}\n\n"
+        "{{Include|src=<img src=x onerror=alert(2)>}}\n",
+        author=author,
+        message="add error escape",
+    )
+    client = create_app.test_client()
+    response = client.get("/Errorescape/view")
+    assert response.status_code == 200
+    soup = BeautifulSoup(response.data.decode(), "html.parser")
+    errors = soup.find_all("p", class_="text-danger")
+    assert len(errors) == 2
+    for error in errors:
+        assert error.find("img") is None
+    assert "onerror=alert(1)" in errors[0].get_text()
+    assert "onerror=alert(2)" in errors[1].get_text()
+
+
+def test_pageindex_embedding_style_list_is_escaped(create_app):
+    author = ("Test Author", "test@example.com")
+    create_app.storage.store(
+        "listescape.md",
+        content="# Index\n{{PageIndex\n|style=list\n|toc=true\n}}\n",
+        author=author,
+        message="add list escape index",
+    )
+    create_app.storage.store(
+        "listescape/page.md",
+        content="# Page\n## &lt;img src=x onerror=alert(3)&gt;\n",
+        author=author,
+        message="add page",
+    )
+    create_app.storage.store(
+        "listescape/<img src=x onerror=alert(4)>.md",
+        content="# Other\n",
+        author=author,
+        message="add page",
+    )
+    client = create_app.test_client()
+    response = client.get("/Listescape/view")
+    assert response.status_code == 200
+    soup = BeautifulSoup(response.data.decode(), "html.parser")
+    pi_div = soup.find("div", class_="pageindex-embedding")
+    assert pi_div is not None
+    assert pi_div.find("img") is None
+    assert "onerror=alert(3)" in pi_div.get_text()
+
+
+@pytest.mark.parametrize(
+    "separator", ["\x0b", "\x0c", "\x1c", "\x85", "\u2028", "\u2029"]
+)
+def test_embedding_option_key_with_line_separator(separator):
+    md = f"{{{{InfoBox\n|a{separator}b=value\ncontent\n}}}}\n"
+    html, _, _ = render.markdown(md)
+    assert "text-danger" not in html
+    soup = BeautifulSoup(html, "html.parser")
+    assert soup.find("strong").get_text() == f"a{separator}b"
+    assert "value" in soup.find("tr", class_="infobox-key-value").get_text()

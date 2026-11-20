@@ -1075,15 +1075,18 @@ class mistunePluginEmbeddings:
         args: EmbeddingArgs,
         cursor: bool = False,
     ):
-        for argument in text.splitlines():
-            parts = argument.rsplit(":", maxsplit=1)
-            value = base64.b64decode(parts[-1].encode()).decode()
-            if len(parts) == 1:
-                args.args.append(value)
-            elif len(parts) == 2:
-                args.options[parts[0]] = value
-
         try:
+            # render_embedding_option ends every entry with \n. Do not use
+            # splitlines(): it also splits on characters like \x0b or \u2028,
+            # which are valid in an option key
+            for argument in text.split("\n")[:-1]:
+                parts = argument.rsplit(":", maxsplit=1)
+                value = base64.b64decode(parts[-1].encode()).decode()
+                if len(parts) == 1:
+                    args.args.append(value)
+                elif len(parts) == 2:
+                    args.options[parts[0]] = value
+
             output = call_hook(
                 "embedding_render",
                 embedding=embedding_name,
@@ -1091,11 +1094,11 @@ class mistunePluginEmbeddings:
             )
         except Exception as e:
             # render exceptions in the output
-            output = f"<p class=\"text-danger\"><tt>{embedding_name}</tt> Error: {e}</p>"
+            output = f"<p class=\"text-danger\"><tt>{mistune.escape(embedding_name)}</tt> Error: {mistune.escape(str(e))}</p>"
 
         if output is None:
             # no ouput means either no embedding has been found or nothing was rendered.
-            output = f"<p class=\"text-danger\">Unknown Embedding:&nbsp;<tt>{embedding_name}</tt></p>"
+            output = f"<p class=\"text-danger\">Unknown Embedding:&nbsp;<tt>{mistune.escape(embedding_name)}</tt></p>"
 
         if cursor:
             return cursormagicword + output
@@ -1120,6 +1123,19 @@ class mistunePluginEmbeddings:
             self._EMBEDDING_SCANNER_PATTERN,
             self.parse_block,
         )
+        # Move embedding_block ahead of the table/nptable rules. In the
+        # combined block scanner the first matching alternative wins; a
+        # one-line embedding that contains a pipe (e.g. {{include|src=Foo}})
+        # is otherwise matched by the (n)ptable rule, which then rejects it
+        # as not-a-table and the line falls back to a paragraph. Registering
+        # ahead of the tables lets single-line embeddings with |options work.
+        if 'embedding_block' in md.block.rules:
+            md.block.rules.remove('embedding_block')
+        try:
+            insert_at = md.block.rules.index('table')
+        except ValueError:
+            insert_at = 0
+        md.block.rules.insert(insert_at, 'embedding_block')
 
         md.renderer.register(
             "embedding_option", _rm(self.render_embedding_option)

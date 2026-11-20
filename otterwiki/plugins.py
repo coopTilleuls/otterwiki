@@ -11,6 +11,7 @@ See docs/plugin_examples for examples.
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from jinja2 import BaseLoader, FileSystemLoader
 from werkzeug.datastructures import MultiDict
 
 import pluggy
@@ -187,6 +188,64 @@ class OtterWikiPluginSpec:
 
         Returns:
             HTML string to inject to the right sidebar, or None
+        """
+
+    @hookspec
+    def template_html_navbar_inject(self, page) -> str | None:
+        """
+        This hook allows plugins to inject HTML content into the navbar.
+        The content will be added after the search field and before the
+        dropdown menu button.
+
+        Args:
+            page: The current page path (optional, may be None)
+
+        Returns:
+            HTML string to inject into the navbar, or None
+        """
+
+    @hookspec
+    def template_html_navbar_dropdown_inject(self, page) -> str | None:
+        """
+        This hook allows plugins to inject HTML content into the dropdown
+        menu of the navbar. The content will be added at the top of the
+        dropdown menu.
+
+        Args:
+            page: The current page path (optional, may be None)
+
+        Returns:
+            HTML string to inject into the navbar dropdown menu, or None
+        """
+
+    @hookspec
+    def template_folders(self) -> list[str] | None:
+        """
+        This hook allows plugins to ship their own Jinja templates, e.g. to
+        render pages served via the url_request and url_admin_request hooks
+        with flask.render_template(). The folders are searched after the
+        templates of An Otter Wiki, so plugins cannot override the core
+        templates, but plugin templates can extend them, e.g. via
+        {% extends "settings.html" %}.
+
+        To avoid name collisions between plugins, place the templates in a
+        subfolder named after the plugin, e.g. templates/<plugin>/page.html
+        and render them via render_template("<plugin>/page.html").
+
+        Returns:
+            A list of absolute paths to template folders, or None
+        """
+
+    @hookspec
+    def template_html_admin_menu_inject(self) -> str | None:
+        """
+        This hook allows plugins to inject HTML content into the admin
+        section of the settings sidebar, e.g. links to pages served via
+        the url_admin_request hook. The content will be appended to the
+        existing admin menu entries.
+
+        Returns:
+            HTML string to inject into the admin menu, or None
         """
 
     @hookspec
@@ -443,6 +502,30 @@ def collect_hook(hook_name, *args, **kwargs):
     except AttributeError:
         pass
     return result
+
+
+class PluginTemplateLoader(BaseLoader):
+    """
+    Jinja loader for the templates shipped with plugins. The folders are
+    collected via the template_folders hook on every lookup, so that plugins
+    registered after the app was created are found, too. Templates are
+    cached by the Jinja environment, so the lookup happens only once per
+    template.
+    """
+
+    def _loader(self):
+        folders = []
+        for result in collect_hook("template_folders"):
+            if isinstance(result, str):
+                result = [result]
+            folders.extend(result)
+        return FileSystemLoader(folders)
+
+    def get_source(self, environment, template):
+        return self._loader().get_source(environment, template)
+
+    def list_templates(self):
+        return self._loader().list_templates()
 
 
 # this plugin_manager is exported so the normal pluggy API can be used in

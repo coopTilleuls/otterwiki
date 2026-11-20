@@ -10,11 +10,12 @@ from flask import Flask
 from flask_mail import Mail
 from flask_sqlalchemy import SQLAlchemy
 from flask_wtf.csrf import CSRFProtect
+from jinja2 import ChoiceLoader
 
 import otterwiki.gitstorage
 import otterwiki.util
 from otterwiki import __version__, fatal_error
-from otterwiki.plugins import plugin_manager
+from otterwiki.plugins import plugin_manager, PluginTemplateLoader
 from otterwiki.renderer import OtterwikiRenderer
 
 app = Flask(__name__)
@@ -41,6 +42,7 @@ app.config.update(
     AUTH_ROLES_WRITE="WRITE",
     AUTH_ROLES_UPLOAD="UPLOAD",
     AUTH_ROLES_ADMIN="ADMIN",
+    PASSWORD_MIN_LENGTH=8,
     READ_ACCESS="ANONYMOUS",
     WRITE_ACCESS="ANONYMOUS",
     ATTACHMENT_ACCESS="ANONYMOUS",
@@ -68,13 +70,16 @@ app.config.update(
     COMMIT_MESSAGE="REQUIRED",  # OPTIONAL DISABLED
     DEFAULT_COMMIT_MESSAGE="",
     GIT_WEB_SERVER=False,
+    GIT_ALLOW_EXTERNAL_SYMLINKS=False,
     GIT_REMOTE_PUSH_ENABLED=False,
     GIT_REMOTE_PUSH_URL="",
     GIT_REMOTE_PUSH_PRIVATE_KEY="",
+    GIT_REMOTE_PUSH_PRIVATE_KEY_FILE="",
     GIT_REMOTE_PULL_ENABLED=False,
     GIT_REMOTE_PULL_URL="",
     GIT_REMOTE_PULL_URL_SECURE=False,
     GIT_REMOTE_PULL_PRIVATE_KEY="",
+    GIT_REMOTE_PULL_PRIVATE_KEY_FILE="",
     SIDEBAR_SHORTCUTS="home pageindex createpage",
     ROBOTS_TXT="allow",
     WIKILINK_STYLE="",
@@ -87,9 +92,11 @@ app.config.update(
     RENDERER_HTML_ALLOWLIST="",
     ADMIN_USER_EMAIL="",
     SESSION_COOKIE_SAMESITE="Lax",
+    REMEMBER_COOKIE_SAMESITE="Lax",
     SECURITY_HEADERS=True,
     WTF_CSRF_ENABLED=True,
     WTF_CSRF_TIME_LIMIT=86400,
+    NOT_FOUND_PAGE="",
 )
 app.config.from_envvar("OTTERWIKI_SETTINGS", silent=True)
 
@@ -112,6 +119,17 @@ for key in app.config:
                 "on",
                 "1",
             ]
+        elif type(app.config[key]) == int:
+            try:
+                app.config[key] = int(os.environ[key])
+            except ValueError:
+                app.logger.warning(
+                    "server: Ignored invalid value in environment variable"
+                    " {}={!r}, using default {}".format(
+                        key, os.environ[key], app.config[key]
+                    )
+                )
+                continue
         else:
             app.config[key] = os.environ[key]
         config_from_environment[key] = app.config[key]
@@ -146,7 +164,10 @@ elif not os.path.exists(app.config["REPOSITORY"]):
     )
 else:
     try:
-        storage = otterwiki.gitstorage.GitStorage(app.config["REPOSITORY"])
+        storage = otterwiki.gitstorage.GitStorage(
+            app.config["REPOSITORY"],
+            allow_external_symlinks=app.config["GIT_ALLOW_EXTERNAL_SYMLINKS"],
+        )
     except otterwiki.gitstorage.StorageError as e:
         fatal_error(e)
 
@@ -198,6 +219,27 @@ from otterwiki.models import *
 mail = None
 
 
+def load_private_key_files():
+    """
+    Read the ssh private keys from the files configured via
+    GIT_REMOTE_PUSH_PRIVATE_KEY_FILE and GIT_REMOTE_PULL_PRIVATE_KEY_FILE,
+    unless the key itself has been configured.
+    """
+    for key in ["GIT_REMOTE_PUSH_PRIVATE_KEY", "GIT_REMOTE_PULL_PRIVATE_KEY"]:
+        filename = app.config.get(f"{key}_FILE")
+        if not filename or app.config.get(key):
+            continue
+        try:
+            with open(filename, "r") as f:
+                app.config[key] = f.read()
+        except OSError as e:
+            app.logger.error(
+                "server: Unable to read {}_FILE \"{}\": {}".format(
+                    key, filename, e
+                )
+            )
+
+
 def update_app_config():
     global mail
     with app.app_context():
@@ -242,6 +284,7 @@ def update_app_config():
                 )
             # update app settings
             app.config[item.name] = item.value
+        load_private_key_files()
         # setup flask_mail
         mail = Mail(app)
 
@@ -269,6 +312,10 @@ for plugin, dist in plugininfo:
 # setup plugins
 plugin_manager.hook.setup(
     app=app, storage=storage, db=db  # pyright: ignore never unbound
+)
+# search the templates shipped with plugins after the core templates
+app.jinja_env.loader = ChoiceLoader(
+    [app.jinja_env.loader, PluginTemplateLoader()]  # pyright: ignore
 )
 
 
@@ -353,7 +400,11 @@ def set_security_headers(response):
     return response
 
 
-from otterwiki.helper import load_custom_html
+from otterwiki.helper import load_custom_html, url_for
+
+# override flask's url_for in templates so the editor endpoint is rewritten
+# to the ?edit query flag (see otterwiki.helper.url_for)
+app.jinja_env.globals.update(url_for=url_for)
 
 
 def plugin_html_head_inject(page=None):
@@ -380,12 +431,35 @@ def plugin_sidebar_right_inject(page=None):
     return ''.join(result for result in results if result)
 
 
+def plugin_navbar_inject(page=None):
+    """Template function to inject HTML into the navbar via plugins."""
+    results = plugin_manager.hook.template_html_navbar_inject(page=page)
+    return ''.join(result for result in results if result)
+
+
+def plugin_navbar_dropdown_inject(page=None):
+    """Template function to inject HTML into the navbar dropdown via plugins."""
+    results = plugin_manager.hook.template_html_navbar_dropdown_inject(
+        page=page
+    )
+    return ''.join(result for result in results if result)
+
+
+def plugin_admin_menu_inject():
+    """Template function to inject HTML into the admin menu via plugins."""
+    results = plugin_manager.hook.template_html_admin_menu_inject()
+    return ''.join(result for result in results if result)
+
+
 app.jinja_env.globals.update(
     load_custom_html=load_custom_html,
     plugin_html_head_inject=plugin_html_head_inject,
     plugin_html_body_inject=plugin_html_body_inject,
     plugin_sidebar_left_inject=plugin_sidebar_left_inject,
     plugin_sidebar_right_inject=plugin_sidebar_right_inject,
+    plugin_navbar_inject=plugin_navbar_inject,
+    plugin_navbar_dropdown_inject=plugin_navbar_dropdown_inject,
+    plugin_admin_menu_inject=plugin_admin_menu_inject,
 )
 
 # initialize git via http

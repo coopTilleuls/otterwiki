@@ -4,6 +4,7 @@
 {% else %}
 {% extends "wiki.html" %}
 {% endif %}
+{% from "snippets/diff_side_by_side.html" import diff_side_by_side %}
 
 {%block head -%}
 {{- super() }}
@@ -25,7 +26,52 @@
 {% block content %}
 <div class="w-full mw-full p-0 clearfix">
 {% if rev_a and rev_b %}
+<nav aria-label="Edit navigation" class="float-right ml-10 mb-10">
+<div class="btn-group" role="group">
+  {% if prev_url %}
+  <a class="btn" href="{{ prev_url }}"><i class="fa fa-angle-left" aria-hidden="true"></i> Previous edit</a>
+  {% else %}
+  <span class="btn disabled" aria-disabled="true"><i class="fa fa-angle-left" aria-hidden="true"></i> Previous edit</span>
+  {% endif %}
+  {% if next_url %}
+  <a class="btn" href="{{ next_url }}">Next edit <i class="fa fa-angle-right" aria-hidden="true"></i></a>
+  {% else %}
+  <span class="btn disabled" aria-disabled="true">Next edit <i class="fa fa-angle-right" aria-hidden="true"></i></span>
+  {% endif %}
+</div>
+</nav>
+<div class="custom-switch diff-view-switch float-right ml-10 mb-10">
+  <input type="checkbox" id="switch-side-by-side" autocomplete="off"{% if view == 'side-by-side' %} checked{% endif %}
+    data-url-inline="{{ url_for('diff', path=pagepath, rev_a=rev_a, rev_b=rev_b, view='inline') }}"
+    data-url-side-by-side="{{ url_for('diff', path=pagepath, rev_a=rev_a, rev_b=rev_b, view='side-by-side') }}"
+    onchange="window.location.href = this.checked ? this.dataset.urlSideBySide : this.dataset.urlInline;">
+  <label for="switch-side-by-side" class="mb-0">Side by side</label>
+</div>
     <h3>Comparing <tt>{{rev_a}}</tt> to <tt>{{rev_b}}</tt></h3>
+{% macro revision_metadata(rev, metadata) %}
+          <tr class="align-top">
+            <td class="font-size-12 min text-nowrap diff-color" style="border-left-color: #{{rev[:6]}};">
+{%- if metadata %}<a href="{{ url_for('view', path=pagepath, revision=rev) }}"><span class="datetime" title="{{metadata.datetime|format_datetime("deltanow")}} ago">{{metadata.datetime|format_datetime}}</span></a> {% endif -%}
+<a href="{{ url_for('show_commit', revision=rev) }}" class="btn revision-small">{{rev}}</a></td>
+            <td class="min text-nowrap">{%- if metadata %}{%if not metadata.author_email%}{{metadata.author_name}}{%else%}<a href="mailto:{{metadata.author_email}}">{{metadata.author_name}}</a>{%endif%}{% endif %}</td>
+            <td class="text-wrap diff-revision-message">{% if metadata %}{{metadata.message or '-/-'}}{% endif %}</td>
+          </tr>
+{% endmacro %}
+<div class="table-responsive table-striped diff-revisions">
+  <table class="table">
+    <thead>
+      <tr>
+        <th>Date</th>
+        <th>Author</th>
+        <th class="w-half">Commit Message</th>
+      </tr>
+    </thead>
+    <tbody>
+{{ revision_metadata(rev_a, metadata_a) }}
+{{ revision_metadata(rev_b, metadata_b) }}
+    </tbody>
+  </table>
+</div>
 {% elif revision %}
     <h3>Commit <tt>{{revision}}</tt></h3>
 {% endif %}
@@ -34,13 +80,33 @@
 {%if not metadata.author_email%}{{metadata.author_name}}{%else%}<a href="mailto:{{metadata.author_email}}">{{metadata.author_name}}</a>{%endif%}:
 {{metadata.message or '-/-'}}
 {%endif%}
+{% if side_by_side %}
+{%- macro side_header(file, url, rev) -%}
+{%- if url %}<a href="{{ url }}"><tt>{{ file }}</tt></a>{% else %}<tt>{{ file }}</tt>{% endif %}
+ <a href="{{ url_for('show_commit', revision=rev) }}" class="revision-small">{{ rev }}</a>
+{%- endmacro %}
+{% for file in patchset %}
+{%- if file.path in side_by_side %}
+{%- set urlobj = url_map[file.path] %}
+{% call diff_side_by_side(side_by_side[file.path], color_a=rev_a[:6], color_b=rev_b[:6]) %}
+<tr>
+  <th class="diff-header" colspan="2">{{ side_header(urlobj.source_file, urlobj.source_url, rev_a) }}</th>
+  <th class="diff-header" colspan="2">{{ side_header(urlobj.target_file, urlobj.target_url, rev_b) }}</th>
+</tr>
+{% endcall %}
+{%- endif %}
+{% endfor %}
+{% else %}
+{# color the changed lines like the commit they belong to #}
+{% set colorcolumn = rev_a and rev_b %}
+{% set colspan = 2 + (2 if withlinenumbers else 0) %}
 <table class="diff">
 {% for file in patchset %}
 {% with filename=file.path,lines=file_diffs[file.path],urlobj=url_map[file.path] %}
 {# {{filename}} {{lines}} {{file}} #}
-{%- if page_filename|length == 0 or filename == page_filename %}
+{%- if not page_filenames or filename in page_filenames %}
 <tr>
-<td class="filename" colspan="{%if withlinenumbers %}4{%else%}2{%endif%}">
+<td class="filename" colspan="{{colspan}}">
 {%- if urlobj.source_file == urlobj.target_file %}
     <tt>{{urlobj.source_file}}</tt> <a href="{{urlobj.source_url}}" class="revision-small">{{rev_a}}</a> ..
     <a href="{{urlobj.target_url}}" class="revision-small">{{rev_b}}</a>
@@ -67,22 +133,28 @@
 {% for l in lines %}
 <tr class="{{l.style}}">
 {%- if l.style == "hunk" %}
-<td class="hunk" colspan="{%if withlinenumbers %}4{%else%}2{%endif%}">{{l.value}}</td>
+<td class="hunk" colspan="{{colspan}}">{{l.value}}</td>
 {%- else %}
+{%- set color = none -%}
+{%- if colorcolumn and l.style == "removed" %}{% set color = rev_a[:6] %}{% elif colorcolumn and l.style == "added" %}{% set color = rev_b[:6] %}{% endif -%}
+{%- set firstcell = ' class="diff-decoration diff-color"' ~ (' style="border-left-color: #' ~ color ~ ';"' if color else '') if colorcolumn else ' class="diff-decoration"' -%}
 {%-if withlinenumbers -%}
-    <td class="diff-decoration">{{l.source}}</td>
+    <td{{ firstcell|safe }}>{{l.source}}</td>
     <td class="diff-decoration">{{l.target}}</td>
-{%- endif -%}
     <td class="diff-decoration">{{l.type}}</td>
+{%- else -%}
+    <td{{ firstcell|safe }}>{{l.type}}</td>
+{%- endif -%}
     <td class="value">{{l.value | replace('\n', '')}}</td>
 {%- endif -%}
 </tr>
 {%- endfor -%}{# l in lines #}
 {%- else -%}
-<!-- skipped page_filename={{page_filename}} filename={{filename}} -->
+<!-- skipped filename={{filename}} -->
 {%- endif %}
 {% endwith %}{# filename,lines in file_diffs #}
 {% endfor %}{# filename,lines in file_diffs #}
 </table>
+{% endif %}{# side_by_side #}
 {######}
 {% endblock %}

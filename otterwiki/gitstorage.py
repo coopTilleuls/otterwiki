@@ -27,6 +27,17 @@ class StorageNotFound(StorageError):
     pass
 
 
+class StorageUnsafePath(StorageNotFound):
+    """
+    Raised when a path resolves (e.g. via a symlink pushed into the
+    repository) to a location outside the repository or into .git. It
+    subclasses StorageNotFound, so reads of such a path are handled like
+    a missing file.
+    """
+
+    pass
+
+
 try:
     FileNotFoundError
 except NameError:
@@ -39,9 +50,12 @@ _REVISION_RE = re.compile(r"\A(?:HEAD|[0-9a-fA-F]{4,64})\Z")
 
 
 class GitStorage(object):
-    def __init__(self, path, initialize=False):
+    def __init__(self, path, initialize=False, allow_external_symlinks=False):
         # make path absolute
         self.path = str(pathlib.Path(path).absolute())
+        # allow symlinks in the working tree that point outside the
+        # repository, see _abspath()
+        self.allow_external_symlinks = allow_external_symlinks
         if initialize:
             self.repo = git.Repo.init(self.path)
         self.repo = self._read_repo()
@@ -60,6 +74,58 @@ class GitStorage(object):
         if os.path.exists(os.path.join(self.path, ".git/RELOAD_GIT")):
             os.remove(os.path.join(self.path, ".git/RELOAD_GIT"))
             self.repo = self._read_repo()
+
+    def _abspath(self, filename):
+        """
+        Join filename with the repository path and make sure the resolved
+        path, after following any symlinks, stays inside the repository.
+
+        Symlinks can be pushed into the working tree via the git http
+        server (or a pull). Opening them blindly would allow reading and
+        writing arbitrary files the wiki process has access to. A path
+        resolving into .git is always rejected, since writing e.g.
+        .git/config allows code execution. Paths outside the repository
+        can be allowed via allow_external_symlinks. A nested .git, e.g. an
+        attachment named .git, is rejected too, since git would treat its
+        directory as a separate repository.
+        """
+        # lowercase, on a case-insensitive filesystem .GIT is .git
+        if ".git" in filename.lower().replace("\\", "/").split("/"):
+            raise StorageUnsafePath(
+                "{} contains a .git path component.".format(filename)
+            )
+        abspath = os.path.join(self.path, filename)
+        root = os.path.realpath(self.path)
+        resolved = os.path.realpath(abspath)
+        # lowercase, on a case-insensitive filesystem .GIT is .git
+        gitdir = os.path.join(root, ".git").lower()
+        if os.path.commonpath([gitdir, resolved.lower()]) == gitdir or (
+            not self.allow_external_symlinks
+            and os.path.commonpath([root, resolved]) != root
+        ):
+            raise StorageUnsafePath(
+                "{} resolves to a path outside the repository.".format(
+                    filename
+                )
+            )
+        return abspath
+
+    def canonical_filename(self, filename):
+        """
+        Return the repository-relative canonical path of an internal path.
+
+        Symlinks are resolved using the same safety checks as _abspath().
+        Paths outside the repository are left unchanged when external
+        symlinks are explicitly allowed.
+        """
+        abspath = self._abspath(filename)
+        root = os.path.realpath(self.path)
+        resolved = os.path.realpath(abspath)
+
+        if os.path.commonpath([root, resolved]) != root:
+            return filename
+
+        return os.path.relpath(resolved, root).replace(os.sep, "/")
 
     def _validate_revision(self, revision):
         """
@@ -101,18 +167,27 @@ class GitStorage(object):
                 pass
 
     def exists(self, filename):
-        return os.path.exists(os.path.join(self.path, filename))
+        try:
+            return os.path.exists(self._abspath(filename))
+        except StorageUnsafePath:
+            return False
+
+    def islink(self, filename):
+        try:
+            return os.path.islink(self._abspath(filename))
+        except StorageUnsafePath:
+            return False
 
     def mtime(self, filename):
         return datetime.fromtimestamp(
-            os.path.getmtime(os.path.join(self.path, filename))
+            os.path.getmtime(self._abspath(filename))
         )
 
     def size(self, filename: str) -> int:
         """
         Get the filesize in bytes
         """
-        return os.path.getsize(os.path.join(self.path, filename))
+        return os.path.getsize(self._abspath(filename))
 
     def isdir(self, dirname):
         return os.path.isdir(os.path.join(self.path, dirname))
@@ -142,8 +217,9 @@ class GitStorage(object):
                     "{} could not be decoded as text.".format(filename)
                 )
             return content
+        abspath = self._abspath(filename)
         try:
-            with open(os.path.join(self.path, filename), mode=mode) as f:
+            with open(abspath, mode=mode) as f:
                 content = f.read(size)
         except (IOError, FileNotFoundError):
             raise StorageNotFound("{} not found.".format(filename))
@@ -266,12 +342,15 @@ class GitStorage(object):
         datetime_obj = datetime.strptime(
             datetime_str, "%a %b %d %H:%M:%S %Y %z"
         )
-        # Get commit msg
-        message = "\n".join(
-            [x.strip() for x in logentry_lines[offset + 4 : -2]]
-        )
-
-        files = logentry_lines[-1].split("\x00")
+        # The message lines are indented, the optional list of files
+        # follows after an empty line. Merge commits come without files.
+        body = logentry_lines[offset + 3 :]
+        files = []
+        if len(body) > 1 and body[-2] == "" and not body[-1].startswith(" "):
+            files = body[-1].split("\x00")
+            body = body[:-2]
+        # Get commit msg, skipping the empty line after the header
+        message = "\n".join([x.strip() for x in body[1:]])
 
         # TODO: make an object?
         metadata = {
@@ -351,13 +430,16 @@ class GitStorage(object):
         content,
         mode="w",
     ):
+        # check before creating any directory, a symlinked parent
+        # directory would otherwise be followed by makedirs
+        abspath = self._abspath(filename)
         dirname = os.path.dirname(filename)
         if dirname != "":
             os.makedirs(
                 os.path.join(self.path, dirname), mode=0o775, exist_ok=True
             )
         # store file on filesystem
-        with open(os.path.join(self.path, filename), mode) as f:
+        with open(abspath, mode) as f:
             f.write(content)
         # check if file has changed
         diff = self.repo.index.diff(None, paths=filename)
@@ -548,7 +630,12 @@ class GitStorage(object):
         author=None,
         no_commit=False,
         files_updated=None,
+        preserve_symlink_target=False,
     ):
+        # check before creating any directory or moving anything, a
+        # symlinked parent directory would otherwise be followed by
+        # makedirs and git mv. exists() hides unsafe paths.
+        self._abspath(new_filename)
         if self.exists(new_filename):
             raise StorageError(
                 f'The filename "{new_filename}" already exist. Please choose a new filename.'
@@ -559,6 +646,24 @@ class GitStorage(object):
             os.makedirs(
                 os.path.join(self.path, dirname), mode=0o775, exist_ok=True
             )
+
+        # git mv preserves the link text, which breaks relative symlinks
+        # moved to another directory. Recalculate only when requested.
+        new_link_target = None
+        if (
+            preserve_symlink_target
+            and os.path.dirname(old_filename) != dirname
+        ):
+            old_path = os.path.join(self.path, old_filename)
+            if os.path.islink(old_path):
+                old_link_target = os.readlink(old_path)
+                if not os.path.isabs(old_link_target):
+                    new_link_target = os.path.relpath(
+                        os.path.join(
+                            os.path.dirname(old_path), old_link_target
+                        ),
+                        os.path.join(self.path, dirname),
+                    )
         try:
             self.repo.git.mv(old_filename, new_filename)
         except Exception as e:
@@ -567,6 +672,12 @@ class GitStorage(object):
                     old_filename, new_filename, e
                 )
             )
+        if new_link_target is not None:
+            new_path = os.path.join(self.path, new_filename)
+            os.unlink(new_path)
+            os.symlink(new_link_target, new_path)
+            # git mv staged the old link text; stage the corrected one too.
+            self.repo.git.add("--", new_filename)
         if message is None:
             message = "{} renamed to {}.".format(old_filename, new_filename)
         if not no_commit:
@@ -622,6 +733,25 @@ class GitStorage(object):
         # get diff via 'git show'
         diff = self.repo.git.show(revision, format="%b")
         return metadata, diff
+
+    def count_objects(self):
+        """
+        Return the output of 'git count-objects -vH'.
+        """
+        try:
+            return self.repo.git.count_objects("-vH")
+        except git.exc.GitCommandError as e:
+            raise StorageError(str(e))
+
+    def gc(self):
+        """
+        Run 'git gc'. GitPython commits never trigger git's automatic
+        housekeeping, so loose objects pile up.
+        """
+        try:
+            return self.repo.git.gc()
+        except git.exc.GitCommandError as e:
+            raise StorageError(str(e))
 
     def get_parent_revision(self, filename, revision):
         """

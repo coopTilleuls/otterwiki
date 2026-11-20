@@ -1,9 +1,13 @@
 #!/usr/bin/env python
 # vim: set et ts=8 sts=4 sw=4 ai:
 
+import os
 import pytest
 import base64
+import pathlib
+from io import BytesIO
 from flask import url_for
+from otterwiki.gitstorage import StorageError
 
 
 @pytest.fixture
@@ -144,6 +148,58 @@ def test_rename_attachment(test_client, req_ctx):
     assert "attachment0_renamed.txt" in response.data.decode()
 
 
+def _gif_bytes():
+    content_b64 = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+    return base64.b64decode(content_b64)
+
+
+def test_upload_attachment_unicode_filename(test_client):
+    # issue #560: unicode characters must be preserved on upload
+    filename = "Градове.gif"
+    data = {"file": (BytesIO(_gif_bytes()), filename)}
+    response = test_client.post(
+        "/Test/attachments",
+        content_type="multipart/form-data",
+        data=data,
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    assert filename in response.data.decode()
+    # the file exists on disk with its unicode name preserved
+    storage_path = test_client._app.storage.path
+    assert pathlib.Path(storage_path, "test", filename).exists()
+
+
+def test_upload_attachment_path_traversal(test_client):
+    # a traversal filename must land safely inside the attachment dir
+    data = {"file": (BytesIO(_gif_bytes()), "../../evil.gif")}
+    response = test_client.post(
+        "/Test/attachments",
+        content_type="multipart/form-data",
+        data=data,
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    storage_path = test_client._app.storage.path
+    # stored inside the page's attachment directory, not outside the repo
+    assert pathlib.Path(storage_path, "test", "evil.gif").exists()
+    assert not pathlib.Path(storage_path).parent.joinpath("evil.gif").exists()
+
+
+def test_rename_attachment_unicode(test_client, req_ctx):
+    response = test_client.post(
+        url_for(
+            "edit_attachment", pagepath="Test", filename="attachment0.txt"
+        ),
+        data={"new_filename": "Градове.txt"},
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    assert "Градове.txt" in response.data.decode()
+    storage_path = test_client._app.storage.path
+    assert pathlib.Path(storage_path, "test", "Градове.txt").exists()
+
+
 def test_rename_page_with_attachment(app_with_attachments, test_client):
     # create test page
     filename = "testa.md"
@@ -206,3 +262,238 @@ def test_rename_page_with_attachment(app_with_attachments, test_client):
         f"/Testa/a/attachment0.txt?revision={log[1]['revision']}"
     )
     assert rv.status_code == 200
+
+
+ATTACHMENT_XSS_PAYLOAD = b"<script>alert(document.domain)</script>"
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "poc.html",
+        "poc.htm",
+        "poc.xhtml",
+        "poc.xml",
+        "poc.xsl",
+    ],
+)
+def test_attachment_active_content_is_downloaded(test_client, filename):
+    data = {"file": (BytesIO(ATTACHMENT_XSS_PAYLOAD), filename)}
+    rv = test_client.post(
+        "/Home/attachments",
+        data=data,
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert rv.status_code == 200
+    rv = test_client.get(f"/Home/a/{filename}")
+    assert rv.status_code == 200
+    assert rv.data == ATTACHMENT_XSS_PAYLOAD
+    assert rv.headers["Content-Disposition"].startswith("attachment")
+    assert filename in rv.headers["Content-Disposition"]
+    assert "sandbox" in rv.headers["Content-Security-Policy"]
+    # the same applies to an attachment requested with a revision
+    revision = test_client.application.storage.log()[0]["revision"]
+    rv = test_client.get(f"/Home/a/{filename}/{revision}")
+    assert rv.status_code == 200
+    assert rv.headers["Content-Disposition"].startswith("attachment")
+    assert "sandbox" in rv.headers["Content-Security-Policy"]
+
+
+def test_attachment_svg_is_inline_and_sandboxed(test_client):
+    svg = (
+        b'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">'
+        b'<script>alert(document.domain)</script>'
+        b'<rect width="10" height="10" fill="red"/></svg>'
+    )
+    data = {"file": (BytesIO(svg), "poc.svg")}
+    rv = test_client.post(
+        "/Home/attachments",
+        data=data,
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert rv.status_code == 200
+    revision = test_client.application.storage.log()[0]["revision"]
+    for url in [
+        "/Home/a/poc.svg",
+        f"/Home/a/poc.svg/{revision}",
+        "/Home/t/poc.svg",
+    ]:
+        rv = test_client.get(url)
+        assert rv.status_code == 200, url
+        assert rv.content_type.startswith("image/svg+xml"), url
+        assert not rv.headers.get("Content-Disposition", "").startswith(
+            "attachment"
+        ), url
+        csp = rv.headers["Content-Security-Policy"]
+        assert "sandbox" in csp, url
+        assert "default-src 'none'" in csp, url
+        assert "script-src" not in csp, url
+
+
+def test_attachment_image_and_text_stay_inline(
+    app_with_attachments, test_client
+):
+    rv = test_client.get("/Test/a/attachment1.gif")
+    assert rv.status_code == 200
+    assert rv.content_type == "image/gif"
+    assert not rv.headers.get("Content-Disposition", "").startswith(
+        "attachment"
+    )
+    assert "sandbox" in rv.headers["Content-Security-Policy"]
+    rv = test_client.get("/Test/t/attachment1.gif")
+    assert rv.status_code == 200
+    assert "sandbox" in rv.headers["Content-Security-Policy"]
+    rv = test_client.get("/Test/a/attachment0.txt")
+    assert rv.status_code == 200
+    assert not rv.headers.get("Content-Disposition", "").startswith(
+        "attachment"
+    )
+
+
+def test_attachment_pdf_skips_sandbox(test_client):
+    data = {"file": (BytesIO(b"%PDF-1.4\n%%EOF\n"), "doc.pdf")}
+    rv = test_client.post(
+        "/Home/attachments",
+        data=data,
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert rv.status_code == 200
+    rv = test_client.get("/Home/a/doc.pdf")
+    assert rv.status_code == 200
+    assert rv.content_type == "application/pdf"
+    assert "Content-Security-Policy" not in rv.headers
+    assert not rv.headers.get("Content-Disposition", "").startswith(
+        "attachment"
+    )
+
+
+def test_attachment_active_content_unicode_filename(test_client):
+    filename = "日本語.html"
+    data = {"file": (BytesIO(ATTACHMENT_XSS_PAYLOAD), filename)}
+    rv = test_client.post(
+        "/Home/attachments",
+        data=data,
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert rv.status_code == 200
+    rv = test_client.get(f"/Home/a/{filename}")
+    assert rv.status_code == 200
+    disposition = rv.headers["Content-Disposition"]
+    assert disposition.startswith("attachment")
+    assert "filename*=UTF-8''" in disposition
+    # the header must be encodable for the WSGI server
+    disposition.encode("latin-1")
+
+
+@pytest.mark.parametrize("path", ["/Linkpage/view", "/Linkpage/attachments"])
+def test_external_symlink_is_skipped(create_app, tmp_path, path):
+    """A symlink to a path outside the repository, e.g. pushed via git, must
+    not break the views that list the attachments of a page."""
+    author = ("Test Author", "test@example.com")
+    create_app.storage.store(
+        "linkpage.md",
+        content="# Linkpage\n",
+        author=author,
+        message="add page",
+    )
+    create_app.storage.store(
+        "linkpage/real.txt",
+        content="real attachment\n",
+        author=author,
+        message="add attachment",
+    )
+    outside = tmp_path / "outside.csv"
+    outside.write_text("outside-content-12345\n")
+    os.symlink(
+        str(outside),
+        os.path.join(create_app.storage.path, "linkpage", "link.csv"),
+    )
+    response = create_app.test_client().get(path)
+    assert response.status_code == 200
+    html = response.data.decode()
+    assert "link.csv" not in html
+    assert "outside-content-12345" not in html
+    if path.endswith("/attachments"):
+        assert "real.txt" in html
+
+
+@pytest.mark.parametrize("filename", ["pwned.txt", "config"])
+def test_upload_into_symlinked_git_directory(create_app, filename):
+    """A page attachment directory symlinked to .git, e.g. pushed via git,
+    must not allow an upload to write into .git."""
+    author = ("Test Author", "test@example.com")
+    create_app.storage.store(
+        "evilpage.md",
+        content="# Evilpage\n",
+        author=author,
+        message="add page",
+    )
+    gitdir = os.path.join(create_app.storage.path, ".git")
+    with open(os.path.join(gitdir, "config")) as f:
+        config = f.read()
+    os.symlink(".git", os.path.join(create_app.storage.path, "evilpage"))
+    client = create_app.test_client()
+    data = {"file": (BytesIO(b"pwned"), filename)}
+    with pytest.raises(StorageError):
+        client.post(
+            "/Evilpage/attachments",
+            content_type="multipart/form-data",
+            data=data,
+        )
+    assert not os.path.exists(os.path.join(gitdir, "pwned.txt"))
+    with open(os.path.join(gitdir, "config")) as f:
+        assert f.read() == config
+
+
+@pytest.mark.parametrize("filename", [".git", ".GIT"])
+def test_upload_attachment_named_git(create_app, filename):
+    """An attachment named .git must not be written, git would treat the
+    attachment directory as a nested repository."""
+    author = ("Test Author", "test@example.com")
+    create_app.storage.store(
+        "nestedgit.md",
+        content="# Nestedgit\n",
+        author=author,
+        message="add page",
+    )
+    client = create_app.test_client()
+    data = {"file": (BytesIO(b"gitdir: /tmp/evil\n"), filename)}
+    with pytest.raises(StorageError):
+        client.post(
+            "/Nestedgit/attachments",
+            content_type="multipart/form-data",
+            data=data,
+        )
+    attachment_dir = os.path.join(create_app.storage.path, "nestedgit")
+    assert not os.path.exists(os.path.join(attachment_dir, ".git"))
+    assert not os.path.exists(os.path.join(attachment_dir, filename))
+
+
+def test_rename_attachment_to_git(create_app):
+    """An attachment must not be renamed to .git."""
+    author = ("Test Author", "test@example.com")
+    create_app.storage.store(
+        "nestedgit.md",
+        content="# Nestedgit\n",
+        author=author,
+        message="add page",
+    )
+    create_app.storage.store(
+        "nestedgit/test.txt",
+        content="gitdir: /tmp/evil\n",
+        author=author,
+        message="add attachment",
+    )
+    client = create_app.test_client()
+    client.post(
+        "/Nestedgit/attachment/test.txt",
+        data={"new_filename": ".git", "message": ""},
+        follow_redirects=True,
+    )
+    attachment_dir = os.path.join(create_app.storage.path, "nestedgit")
+    assert not os.path.exists(os.path.join(attachment_dir, ".git"))
+    assert os.path.exists(os.path.join(attachment_dir, "test.txt"))

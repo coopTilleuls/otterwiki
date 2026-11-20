@@ -6,12 +6,14 @@ import pytest
 from otterwiki.util import (
     sha256sum,
     sizeof_fmt,
+    plural,
     slugify,
     split_path,
     join_path,
     is_valid_email,
     empty,
     sanitize_pagename,
+    sanitize_filename,
     get_pagepath,
     get_page_directoryname,
     random_password,
@@ -22,6 +24,10 @@ from otterwiki.util import (
     strfdelta_round,
     is_valid_name,
     int_or_None,
+    diff_content,
+    diff_side_by_side,
+    diff_side_by_side_html,
+    diff_words,
 )
 
 
@@ -32,6 +38,12 @@ def test_sizeof_fmt():
     assert sizeof_fmt(8.5 * 1024**4) == "8.5TiB"
     assert sizeof_fmt(512) == "512.0B"
     assert sizeof_fmt(42 * 1024**8) == "42.0YiB"
+
+
+def test_plural():
+    assert plural(0, "page") == "0 pages"
+    assert plural(1, "page") == "1 page"
+    assert plural(2, "page") == "2 pages"
 
 
 def test_slugigy():
@@ -124,6 +136,31 @@ def test_sanitize_pagename():
     assert sanitize_pagename("IT/SystemD", handle_md=True) == "IT/SystemD"
     assert sanitize_pagename("IT/Systemd", handle_md=True) == "IT/Systemd"
     assert sanitize_pagename("IT/Systemd.md", handle_md=True) == "IT/Systemd"
+
+
+def test_sanitize_filename():
+    # unicode is preserved (issue #560)
+    assert sanitize_filename("Градове.pdf") == "Градове.pdf"
+    assert sanitize_filename("test.png") == "test.png"
+    assert sanitize_filename("😊.png") == "😊.png"
+    # path components are stripped, keeping only the final segment
+    assert sanitize_filename("../../Градове.pdf") == "Градове.pdf"
+    assert sanitize_filename("foo/bar.txt") == "bar.txt"
+    assert sanitize_filename("foo\\bar.txt") == "bar.txt"
+    assert sanitize_filename("/etc/passwd") == "passwd"
+    # pure traversal / empty names are rejected
+    assert sanitize_filename("..") == ""
+    assert sanitize_filename(".") == ""
+    assert sanitize_filename("") == ""
+    assert sanitize_filename("/") == ""
+    # NUL and control characters are removed
+    assert sanitize_filename("a\x00b.txt") == "ab.txt"
+    assert sanitize_filename("a\tb\n.txt") == "ab.txt"
+    # leading dots are preserved (e.g. dotfiles)
+    assert sanitize_filename(".gitignore") == ".gitignore"
+    # trailing dots and whitespace are stripped
+    assert sanitize_filename("name. ") == "name"
+    assert sanitize_filename("  name.txt  ") == "name.txt"
 
 
 def test_random_password():
@@ -296,3 +333,101 @@ def test_sha256sum():
         sha256sum("An Otter Wiki")
         == "c0b00e171401dfa2c70f2524fa977d66ead451ec9837543556fc66087b211646"
     )
+
+
+def test_diff_content():
+    lines = diff_content("a\nb\nc\n", "a\nB\nc\nd\n")
+    assert lines[0]["style"] == "hunk"
+    changed = [(l["type"], l["value"]) for l in lines[1:] if l["style"]]
+    assert changed == [("-", "b\n"), ("+", "B\n"), ("+", "d\n")]
+    # identical content, line endings and the trailing newline are ignored
+    assert diff_content("a\nb\n", "a\nb\n") == []
+    assert diff_content("a\r\nb\r\n", "a\nb") == []
+
+
+def test_diff_side_by_side():
+    lines = diff_content("a\nb\nc\nx\n", "a\nB\nB2\nc\n")
+    rows = diff_side_by_side(lines)
+
+    def cell(line):
+        return (line["type"], line["value"]) if line else None
+
+    assert rows[0] == {"hunk": "@@ 1,4 1,4 @@"}
+    assert [(cell(r["left"]), cell(r["right"])) for r in rows[1:]] == [
+        ((" ", "a\n"), (" ", "a\n")),
+        (("-", "b\n"), ("+", "B\n")),
+        (None, ("+", "B2\n")),
+        ((" ", "c\n"), (" ", "c\n")),
+        (("-", "x\n"), None),
+    ]
+    assert diff_side_by_side([]) == []
+
+
+def test_diff_side_by_side_html():
+    lines = diff_content("a <b>\nsome text\nc\n", "a <b>\nsome new text\n")
+    html_a = ["A", "B", "C"]
+    rows = diff_side_by_side_html(lines, html_a=html_a)
+    assert rows[0] == {"hunk": "@@ 1,3 1,2 @@"}
+    # unchanged lines use the highlighted html if given
+    assert rows[1] == {
+        "left": {"number": 1, "style": "", "html": "A", "partial": False},
+        "right": {
+            "number": 1,
+            "style": "",
+            "html": "a &lt;b&gt;",
+            "partial": False,
+        },
+        "context": True,
+    }
+    # changed lines are compared word by word and marked as partial
+    assert rows[2]["context"] is False
+    assert rows[2]["left"]["html"] == "some text"
+    assert rows[2]["right"]["html"] == (
+        'some <span class="diff-word added">new </span>text'
+    )
+    assert rows[2]["left"]["partial"] is True
+    assert rows[2]["right"]["partial"] is True
+    # removed lines without a counterpart
+    assert rows[3]["left"] == {
+        "number": 3,
+        "style": "removed",
+        "html": "C",
+        "partial": False,
+    }
+    assert rows[3]["right"] is None
+
+
+def test_diff_side_by_side_html_replaced_line():
+    lines = diff_content(
+        "This line will be replaced completely.\n",
+        "Something totally different written here instead.\n",
+    )
+    rows = diff_side_by_side_html(lines)
+    # a completely changed line is not compared word by word
+    assert rows[1]["left"]["partial"] is False
+    assert rows[1]["right"]["partial"] is False
+    assert "diff-word" not in rows[1]["left"]["html"]
+    assert "diff-word" not in rows[1]["right"]["html"]
+
+
+def test_diff_words():
+    assert diff_words("a <b> simple wiki", "a <b> small wiki") == (
+        'a &lt;b&gt; <span class="diff-word removed">simple</span> wiki',
+        'a &lt;b&gt; <span class="diff-word added">small</span> wiki',
+    )
+    # only the added words are marked, the removed side has none
+    assert diff_words("Donec arcu vel.", "Donec arcu vel. Abc.") == (
+        "Donec arcu vel.",
+        'Donec arcu vel.<span class="diff-word added"> Abc.</span>',
+    )
+    # lines without much in common are not compared word by word
+    assert diff_words("completely different", "nothing alike here") is None
+    # matching whitespace doesn't make different lines look alike
+    assert (
+        diff_words(
+            "This line will be removed entirely.",
+            "A brand new line added by the draft.",
+        )
+        is None
+    )
+    assert diff_words("", "") is None
