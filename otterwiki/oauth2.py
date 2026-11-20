@@ -111,7 +111,7 @@ def gcp_callback():
         return "User email not available or not verified by Google.", 400
     # Create a user in your db with the information provided
     # by Google
-    auth_manager.handle_login(
+    auth_manager.handle_oauth2_login(
         id=unique_id, name=users_name, email=users_email, profile_pic=picture
     )
     next_page = sanitize_next_url(session.pop("oauth2_next", None))

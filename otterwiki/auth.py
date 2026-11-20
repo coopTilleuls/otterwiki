@@ -749,7 +749,28 @@ class OAuth2:
 
     User = OAuth2User
 
-    def handle_login(self,id , name, email, profile_pic):
+    # Authentication is delegated to Google: every password based flow
+    # (form login, lost password, email confirmation, registration) is
+    # unsupported. The views still route to these methods, so instead of
+    # crashing with an AttributeError/TypeError (500) send the user to
+    # the SSO.
+    def _redirect_to_sso(self, *args, **kwargs):
+        return redirect(url_for("oauth2_login"))
+
+    handle_login = _redirect_to_sso
+    lost_password_form = _redirect_to_sso
+    handle_recover_password = _redirect_to_sso
+    handle_recover_password_token = _redirect_to_sso
+    handle_request_confirmation = _redirect_to_sso
+    handle_confirmation = _redirect_to_sso
+    register_form = _redirect_to_sso
+    handle_register = _redirect_to_sso
+
+    def check_credentials(self, email, password):
+        # no passwords: never authenticate via basic auth (git http)
+        return None
+
+    def handle_oauth2_login(self, id, name, email, profile_pic):
         if len(self.User.query.all()) < 1:
             is_admin = True
 
