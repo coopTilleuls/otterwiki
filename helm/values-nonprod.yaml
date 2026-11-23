@@ -3,7 +3,10 @@
 # Usage: helm upgrade --install otter-wiki . --values ./values.yaml --values ./values-nonprod.yaml --set ...
 image:
   repository: rg.fr-par.scw.cloud/infra-mut-cr-scw/otterwiki
-  tag: t1.9.3
+  # The deployed tag is set by Argo CD Image Updater (image.tag Helm
+  # parameter on the Argo application, tags nonprod-*), which overrides this
+  # value. Kept as a fallback only: bump it along with the nonprod-* tags.
+  tag: nonprod-1.1.2
 
 imagePullSecrets:
   - name: regcred
