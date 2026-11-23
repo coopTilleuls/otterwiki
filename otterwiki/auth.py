@@ -818,14 +818,18 @@ class OAuth2:
             return ("Anonymous", "")
         return (current_user.name, current_user.email)
 
-    # user will be directed to login form first, we should redirect them to handle_login automatically (just a POST to /-/login)
+    # Many upstream views (history, blame, search, changelog, ...) send
+    # anonymous users to url_for("login") instead of the login_view: forward
+    # them to the SSO, keeping `next` so they land back where they were.
     def login_form(self, *args, **kwargs):
-        if current_user.is_authenticated and self.has_permission(
-            'READ', current_user
-        ):
+        if not current_user.is_authenticated:
+            next_url = request.args.get("next")
+            if next_url:
+                return redirect(url_for("oauth2_login", next=next_url))
+            return redirect(url_for("oauth2_login"))
+        if self.has_permission('READ', current_user):
             return redirect(url_for("index"))
-        else:
-            return abort(403)
+        return abort(403)
 
     def settings_form(self):
         return render_template(

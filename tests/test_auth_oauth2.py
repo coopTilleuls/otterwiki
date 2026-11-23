@@ -180,3 +180,48 @@ def test_anonymous_cannot_read_or_write(oauth2_app):
     assert "/-/oauth2_login" in rv.location
     rv = client.post("/Home/save", data={"content": "pwned", "commit": "x"})
     assert rv.status_code == 403
+
+
+def follow_to_sso(client, path):
+    """Follow the redirects of an anonymous request up to the SSO, return
+    the final location."""
+    from urllib.parse import urlsplit
+
+    rv = client.get(path)
+    for _ in range(3):
+        assert rv.status_code == 302, (path, rv.status_code)
+        location = urlsplit(rv.location)
+        if location.path == "/-/oauth2_login":
+            return rv.location
+        rv = client.get(
+            location.path + ("?" + location.query if location.query else "")
+        )
+    raise AssertionError(f"{path} never reached the SSO: {rv.location}")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/Home/history",
+        "/Home/source",
+        "/Home/blame",
+        "/Home/attachments",
+        "/Home/a/file.txt",
+        "/-/index",
+        "/-/search",
+        "/-/changelog",
+        "/-/log",
+    ],
+)
+def test_anonymous_is_sent_to_sso_with_next(oauth2_app, path):
+    from urllib.parse import parse_qs, urlsplit
+
+    client = oauth2_app.test_client()
+    location = follow_to_sso(client, path)
+    next_url = parse_qs(urlsplit(location).query).get("next", [""])[0]
+    assert next_url.startswith(path), (path, location)
+
+
+def test_login_form_redirects_anonymous_to_sso(oauth2_app):
+    client = oauth2_app.test_client()
+    assert_redirects_to_sso(client.get("/-/login"))
