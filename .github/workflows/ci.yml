@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          # Same interpreter as the Docker image (debian 12, python3.11).
+          python-version: "3.11"
+
+      - name: Install
+        run: pip install . pytest
+
+      - name: pytest
+        env:
+          OTTERWIKI_SETTINGS: ""
+        run: pytest tests docs/plugin_examples/tests
+
+  helm-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: helm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+        with:
+          version: v3.16.1
+
+      - name: helm lint
+        run: |
+          for env in nonprod prod; do
+            helm lint . -f values.yaml -f "values-${env}.yaml"
+          done
+
+      - name: helm template
+        run: |
+          for env in nonprod prod; do
+            helm template "${env}-otterwiki" . -f values.yaml -f "values-${env}.yaml" > /dev/null
+          done

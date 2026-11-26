@@ -1,0 +1,53 @@
+version: 2
+updates:
+  # Python dependencies pinned in pyproject.toml ([project].dependencies).
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: Europe/Paris
+    open-pull-requests-limit: 10
+    groups:
+      pip-patch:
+        patterns: ["*"]
+        update-types: ["patch"]
+
+  # CodeMirror bundle sources. The built bundle under otterwiki/static is committed:
+  # a merged update only ships once someone runs `make frontend` and commits the result.
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: Europe/Paris
+    open-pull-requests-limit: 10
+    groups:
+      npm-patch:
+        patterns: ["*"]
+        update-types: ["patch"]
+
+  # Base images: Dockerfile (debian, built by CD) and docker/Dockerfile.slim (alpine, upstream only).
+  - package-ecosystem: docker
+    directories: ["/", "/docker"]
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: Europe/Paris
+    open-pull-requests-limit: 10
+    groups:
+      docker-patch:
+        patterns: ["*"]
+        update-types: ["patch"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: Europe/Paris
+    open-pull-requests-limit: 10
+    groups:
+      github-actions-patch:
+        patterns: ["*"]
+        update-types: ["patch"]
