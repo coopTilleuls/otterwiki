@@ -1,7 +1,7 @@
 #
 # compile stage
 #
-FROM debian:12.14-slim AS compile-stage
+FROM debian:13.7-slim AS compile-stage
 # platform for namespacing the pip cache: emulated 32-bit arm platforms all
 # report armv7l, wheels built for armel/armhf would poison each others cache
 ARG TARGETPLATFORM
@@ -52,7 +52,7 @@ CMD ["tox"]
 #
 # production stage
 #
-FROM debian:12.14-slim
+FROM debian:13.7-slim
 LABEL maintainer="Ralph Thesen <mail@redimp.de>"
 LABEL org.opencontainers.image.source="https://github.com/redimp/otterwiki"
 # version of An Otter Wiki, passed via the Makefile
