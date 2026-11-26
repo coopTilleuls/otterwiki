@@ -21,6 +21,13 @@ jobs:
           # Same interpreter as the Docker image (debian 12, python3.11).
           python-version: "3.11"
 
+      # tests/test_gitstorage.py::test_log_merge_commit runs a plain `git merge`, which
+      # needs a committer identity (none is set on the runner).
+      - name: Git identity for the tests
+        run: |
+          git config --global user.name "CI"
+          git config --global user.email "ci@example.invalid"
+
       - name: Install
         run: pip install . pytest
 
