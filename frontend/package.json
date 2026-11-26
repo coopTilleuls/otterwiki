@@ -5,7 +5,7 @@
   "type": "module",
   "dependencies": {
     "codemirror": "^6.0.0",
-    "@codemirror/state": "^6.0.0",
+    "@codemirror/state": "^6.7.6",
     "@codemirror/view": "^6.0.0",
     "@codemirror/commands": "^6.0.0",
     "@codemirror/language": "^6.0.0",
