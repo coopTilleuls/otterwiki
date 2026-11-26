@@ -1,7 +1,7 @@
 #
 # compile stage
 #
-FROM alpine:3.20.1 AS compile-stage
+FROM alpine:3.24.4 AS compile-stage
 # platform for namespacing the pip cache: emulated 32-bit arm platforms all
 # report armv7l, wheels built for one platform would poison the others cache
 ARG TARGETPLATFORM
@@ -31,7 +31,7 @@ RUN pip install .
 #
 # production stage
 #
-FROM alpine:3.20.1
+FROM alpine:3.24.4
 LABEL maintainer="Ralph Thesen <mail@redimp.de>"
 LABEL org.opencontainers.image.source="https://github.com/redimp/otterwiki"
 # version of An Otter Wiki, passed via the Makefile
